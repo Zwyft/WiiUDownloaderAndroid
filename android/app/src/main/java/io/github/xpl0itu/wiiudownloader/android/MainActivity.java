@@ -1086,7 +1086,8 @@ public final class MainActivity extends Activity {
             setStatus("Finished with " + Math.max(failures, 1) + " failure(s). " + error, R.color.danger);
             progressBar.setProgress(0);
         } else if (decryptRun) {
-            setStatus("Decryption finished", R.color.success);
+            int folders = DownloadService.decryptedFolders();
+            setStatus(folders > 1 ? "Decrypted " + folders + " folders" : "Decryption finished", R.color.success);
             progressBar.setProgress(100);
         } else {
             setStatus("Finished — saved to " + outputDirectory, R.color.success);
@@ -1107,6 +1108,9 @@ public final class MainActivity extends Activity {
     // -------------------------------------------------------- folder picking
 
     private void pickFolder(int requestCode) {
+        if (requestCode == REQUEST_DECRYPT_TREE) {
+            toast("Pick the downloaded title folder, or a folder that contains it");
+        }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_WRITE_URI_PERMISSION

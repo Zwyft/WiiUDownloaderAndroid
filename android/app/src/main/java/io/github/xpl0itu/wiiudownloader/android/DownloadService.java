@@ -59,6 +59,7 @@ public final class DownloadService extends Service {
     private static volatile int totalTitles;
     private static volatile int completedTitles;
     private static volatile int failures;
+    private static volatile int decryptedFolders;
     private static volatile String lastError = "";
     private static volatile String currentTitle = "";
     private static volatile String mode = MODE_DOWNLOAD;
@@ -204,7 +205,8 @@ public final class DownloadService extends Service {
                 throw new IllegalArgumentException("no folder selected");
             }
             // Decrypt in place: the decrypted files replace the encrypted ones.
-            Mobile.decryptFolder(folder, folder, deleteEncrypted);
+            // The core accepts the title folder or a folder that contains it.
+            decryptedFolders = (int) Mobile.decryptPickedFolder(folder, deleteEncrypted);
             completedTitles = 1;
         } catch (Exception runError) {
             failureCount++;
@@ -418,6 +420,7 @@ public final class DownloadService extends Service {
         totalTitles = titleCount;
         completedTitles = 0;
         failures = 0;
+        decryptedFolders = 0;
         cancelled = false;
         lastError = "";
         currentTitle = "";
@@ -451,6 +454,10 @@ public final class DownloadService extends Service {
 
     static String lastError() {
         return lastError;
+    }
+
+    static int decryptedFolders() {
+        return decryptedFolders;
     }
 
     static String lastMode() {

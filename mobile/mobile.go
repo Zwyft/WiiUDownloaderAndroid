@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +23,7 @@ import (
 
 const (
 	// AppVersion is shown in the Android UI.
-	AppVersion = "1.2.0-android"
+	AppVersion = "1.2.1-android"
 
 	userAgent = "WiiUDownloader-Android"
 )
@@ -203,6 +205,88 @@ func DecryptFolder(folder string, outputDirectory string, deleteEncrypted bool) 
 	runErr := wiiu.DecryptContents(folder, reporter{}, deleteEncrypted, outputDirectory)
 	setResult(runErr)
 	return runErr
+}
+
+// DecryptPickedFolder decrypts the folder chosen in the app's folder picker.
+//
+// Android hands back whatever folder the user tapped, which is often the folder
+// that *contains* the downloaded title folders (or the app's output folder with
+// several titles in it) rather than a single title folder. So this accepts
+// either: the picked folder is decrypted when it holds a title.tmd, otherwise
+// every folder below it that does is decrypted in turn. It returns how many
+// folders were decrypted.
+func DecryptPickedFolder(folder string, deleteEncrypted bool) (int, error) {
+	root := strings.TrimSpace(folder)
+	if root == "" {
+		return 0, fmt.Errorf("no folder selected")
+	}
+
+	targets := titleFoldersUnder(root)
+	if len(targets) == 0 {
+		return 0, fmt.Errorf("no title.tmd in %q or its subfolders: pick the downloaded title folder (the one that holds title.tmd)", filepath.Base(root))
+	}
+
+	beginRun("Decrypting")
+	defer endRun()
+
+	decrypted := 0
+	var firstErr error
+	for _, target := range targets {
+		if cancelled() {
+			break
+		}
+		setPhase("decrypt", "Decrypting "+filepath.Base(target))
+		if err := wiiu.DecryptContents(target, reporter{}, deleteEncrypted, target); err != nil {
+			firstErr = fmt.Errorf("%s: %w", filepath.Base(target), err)
+			setResult(firstErr)
+			break
+		}
+		decrypted++
+	}
+	return decrypted, firstErr
+}
+
+// titleFoldersUnder lists the folders to decrypt for root: root itself when it
+// holds a title.tmd, otherwise the descendant folders that do. A folder that is
+// found is not searched further, so a title folder's own files are never
+// mistaken for another title.
+func titleFoldersUnder(root string) []string {
+	if hasTitleTMD(root) {
+		return []string{root}
+	}
+
+	found := make([]string, 0, 4)
+	const maxDepth = 3
+
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			child := filepath.Join(dir, entry.Name())
+			if hasTitleTMD(child) {
+				found = append(found, child)
+				continue
+			}
+			if depth+1 < maxDepth {
+				walk(child, depth+1)
+			}
+		}
+	}
+	walk(root, 0)
+
+	sort.Strings(found)
+	return found
+}
+
+func hasTitleTMD(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "title.tmd"))
+	return err == nil && info.Mode().IsRegular()
 }
 
 // Cancel requests cancellation of the running transfer.
