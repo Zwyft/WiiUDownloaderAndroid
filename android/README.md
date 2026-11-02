@@ -26,8 +26,11 @@ speaks only strings, numbers, booleans and errors:
 | `Mobile.searchTitles(q, category, regionMask, limit)` | JSON array of matches |
 | `Mobile.titleInfo(titleId)` | JSON object for one title ID |
 | `Mobile.titleSize(titleId, version)` | download size in bytes |
-| `Mobile.downloadTitle(id, version, dir, decrypt, deleteEncrypted)` | blocking download, then optional decrypt |
+| `Mobile.downloadTitle(id, version, dir, decrypt, deleteEncrypted, packWUA)` | blocking download, optional decrypt, optional `.wua` pack |
 | `Mobile.decryptFolder(folder, out, deleteEncrypted)` | decrypt an existing download |
+| `Mobile.decryptPickedFolder(folder, deleteEncrypted)` | decrypt every title folder below a picked folder |
+| `Mobile.packPickedFolderToWUA(folder, removeSource)` | decrypt and pack titles into `.wua`, then delete the working folders |
+| `Mobile.setTempDirectory(dir)` | point the core's temp files at the app sandbox |
 | `Mobile.progress()` | polled JSON snapshot (bytes, speed, phase, error) |
 | `Mobile.cancel()` | cancel the running transfer |
 
@@ -60,7 +63,7 @@ v0.23.0 to v0.24.0 as x/mobile requires it.
 
 ## Installing
 
-1. Copy `WiiUDownloader-android-1.2.2.apk` to the phone and open it.
+1. Copy `WiiUDownloader-android-1.3.0.apk` to the phone and open it.
 2. Allow "install unknown apps" for the app you opened it from when prompted.
 
 Minimum Android 7.0 (API 24), target SDK 34, ABIs arm64-v8a, armeabi-v7a and
@@ -91,6 +94,16 @@ build.
   decrypted/extracted tree). "Delete encrypted after decrypt" matches the
   desktop option. Pick either the downloaded title folder or a folder that
   contains it: every folder holding a `title.tmd` is decrypted in turn.
+- **Save as .wua** packs the decrypted title into a Cemu archive instead of
+  leaving a folder behind. A `.wua` is a ZArchive container: 64 KiB zstd blocks,
+  an offset table, a name table, a file tree and a SHA-256 footer. The title goes
+  in under the folder name Cemu expects (`<16-digit title id>_v<title version>`,
+  e.g. `0005000010143500_v16`), holding only the extracted `code`/`content`/`meta`
+  tree — the encrypted `.app`/`.h3` payloads, `title.tmd`, `title.tik` and
+  `title.cert` are left out. Once the archive is written the working folder is
+  deleted, so the `.wua` replaces it and nothing is duplicated. This app writes
+  the archives itself (`../zarchive.go`, `../wua.go`), so no PC or Cemu install
+  is needed; the output is Cemu-only (a real Wii U needs the encrypted files).
 - Transfers run in a foreground service with a progress notification (percent,
   speed, queue position) and a Cancel action, so a screen-off or backgrounded
   app keeps downloading. Android 13+ asks once for the notification permission;
@@ -112,8 +125,9 @@ The UI is built in code — the app links only the platform framework, so there
 is no AndroidX or Material Components dependency — on top of a small design
 system:
 
-- `res/values/colors.xml` holds the dark palette: background, two surface
-  levels, stroke, one blue accent, success and danger.
+- `res/values/colors.xml` holds a warm palette instead of the usual tech blue:
+  espresso background and surfaces, cream type, a terracotta accent for actions
+  and selected chips, and a sage green for finished states. Nothing glows.
 - `res/values/styles.xml` defines `AppTheme`, which colours the window, status
   and navigation bars and the control accent; the manifest references it.
 - `res/drawable/progress_horizontal.xml` is the rounded transfer bar.
@@ -123,9 +137,12 @@ system:
 
 The screen reads top to bottom as: header with the core version, rounded search
 field, filter chips for type and region, the title list as cards with a check
-badge per queued title, decrypt/delete toggles, a transfer card (status,
-progress, queue summary and output folder), the primary Download/Cancel pair,
-and a row of quick actions (title list, add ID, folder, decrypt, clear).
+badge per queued title, the option toggles (decrypt, save as .wua, delete
+encrypted), a transfer card (status, progress, queue summary and output folder),
+the primary Download/Cancel pair, and a row of quick actions (title list, add ID,
+folder, decrypt, clear). The `.wua` toggle forces decrypt on, because packing
+needs the decrypted title, and dims "delete encrypted" since a packed archive
+always removes the working files.
 
 ## Known limitations
 

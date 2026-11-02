@@ -82,6 +82,7 @@ public final class MainActivity extends Activity {
     private static final String PREF_OUTPUT_DIR = "output_dir";
     private static final String PREF_DECRYPT = "decrypt";
     private static final String PREF_DELETE_ENCRYPTED = "delete_encrypted";
+    private static final String PREF_PACK_WUA = "pack_wua";
     private static final String PREF_CATALOG_URL = "catalog_url";
     private static final String PREF_DATABASE = "database_json"; // legacy copy kept in prefs
 
@@ -122,6 +123,7 @@ public final class MainActivity extends Activity {
     private TextView cancelButton;
     private CheckBox decryptCheckBox;
     private CheckBox deleteEncryptedCheckBox;
+    private CheckBox packWuaCheckBox;
     private TitleAdapter adapter;
 
     private final List<TextView> categoryChips = new ArrayList<>();
@@ -211,6 +213,8 @@ public final class MainActivity extends Activity {
 
         decryptCheckBox.setChecked(prefs.getBoolean(PREF_DECRYPT, true));
         deleteEncryptedCheckBox.setChecked(prefs.getBoolean(PREF_DELETE_ENCRYPTED, false));
+        packWuaCheckBox.setChecked(prefs.getBoolean(PREF_PACK_WUA, false));
+        syncToggleState();
 
         loadStoredDatabase();
         refreshList();
@@ -285,6 +289,19 @@ public final class MainActivity extends Activity {
         TextView title = text("WiiUDownloader", 22, R.color.text_primary);
         title.setTypeface(medium());
         titles.addView(title);
+
+        // A thin terracotta rule under the wordmark: the one decorative mark in
+        // the layout, and the anchor for the accent colour used by actions.
+        View accentRule = new View(this);
+        GradientDrawable rule = new GradientDrawable();
+        rule.setColor(color(R.color.accent));
+        rule.setCornerRadius(dp(2));
+        accentRule.setBackground(rule);
+        LinearLayout.LayoutParams ruleParams = new LinearLayout.LayoutParams(dp(28), dp(3));
+        ruleParams.topMargin = dp(7);
+        ruleParams.bottomMargin = dp(5);
+        accentRule.setLayoutParams(ruleParams);
+        titles.addView(accentRule);
 
         TextView subtitle = text("Wii U titles · core " + Mobile.version(), 11, R.color.text_secondary);
         subtitle.setLetterSpacing(0.02f);
@@ -464,23 +481,59 @@ public final class MainActivity extends Activity {
     }
 
     private View buildToggles() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout optionsRow = new LinearLayout(this);
+        optionsRow.setOrientation(LinearLayout.HORIZONTAL);
+        optionsRow.setGravity(Gravity.CENTER_VERTICAL);
 
         decryptCheckBox = toggle("Decrypt", PREF_DECRYPT);
         decryptCheckBox.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(decryptCheckBox);
+        optionsRow.addView(decryptCheckBox);
+
+        packWuaCheckBox = toggle("Save as .wua", PREF_PACK_WUA);
+        packWuaCheckBox.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        packWuaCheckBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(android.widget.CompoundButton buttonView, boolean isChecked) {
+                prefs.edit().putBoolean(PREF_PACK_WUA, isChecked).apply();
+                syncToggleState();
+            }
+        });
+        optionsRow.addView(packWuaCheckBox);
+        column.addView(optionsRow);
+
+        LinearLayout cleanupRow = new LinearLayout(this);
+        cleanupRow.setOrientation(LinearLayout.HORIZONTAL);
+        cleanupRow.setGravity(Gravity.CENTER_VERTICAL);
 
         deleteEncryptedCheckBox = toggle("Delete encrypted", PREF_DELETE_ENCRYPTED);
         deleteEncryptedCheckBox.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(deleteEncryptedCheckBox);
+        cleanupRow.addView(deleteEncryptedCheckBox);
+        column.addView(cleanupRow);
 
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         params.bottomMargin = dp(10);
-        row.setLayoutParams(params);
-        return row;
+        column.setLayoutParams(params);
+        return column;
+    }
+
+    /**
+     * Keeps the option toggles consistent: packing needs the decrypted title, and
+     * a .wua always deletes the working files once the archive is written, so the
+     * delete-encrypted choice no longer applies.
+     */
+    private void syncToggleState() {
+        boolean pack = packWuaCheckBox != null && packWuaCheckBox.isChecked();
+        if (pack && decryptCheckBox != null && !decryptCheckBox.isChecked()) {
+            decryptCheckBox.setChecked(true);
+        }
+        if (deleteEncryptedCheckBox != null) {
+            deleteEncryptedCheckBox.setEnabled(!pack);
+            deleteEncryptedCheckBox.setAlpha(pack ? 0.45f : 1f);
+        }
     }
 
     private CheckBox toggle(String label, final String prefKey) {
@@ -1041,9 +1094,10 @@ public final class MainActivity extends Activity {
 
         final boolean decrypt = decryptCheckBox.isChecked();
         final boolean deleteEncrypted = deleteEncryptedCheckBox.isChecked();
+        final boolean pack = decrypt && packWuaCheckBox.isChecked();
         List<Title> batch = new ArrayList<>(queue.values());
 
-        DownloadService.startDownloads(this, batch, outputDirectory, decrypt, deleteEncrypted);
+        DownloadService.startDownloads(this, batch, outputDirectory, decrypt, deleteEncrypted, pack);
         ensureNotificationPermission();
 
         updateQueueUi();
@@ -1058,7 +1112,7 @@ public final class MainActivity extends Activity {
             toast("A transfer is already running");
             return;
         }
-        DownloadService.startDecrypt(this, path, deleteEncryptedCheckBox.isChecked());
+        DownloadService.startDecrypt(this, path, deleteEncryptedCheckBox.isChecked(), packWuaCheckBox.isChecked());
         ensureNotificationPermission();
 
         updateQueueUi();
@@ -1089,8 +1143,13 @@ public final class MainActivity extends Activity {
             setStatus("Finished with " + Math.max(failures, 1) + " failure(s). " + error, R.color.danger);
             progressBar.setProgress(0);
         } else if (decryptRun) {
-            int folders = DownloadService.decryptedFolders();
-            setStatus(folders > 1 ? "Decrypted " + folders + " folders" : "Decryption finished", R.color.success);
+            if (DownloadService.packToWUA()) {
+                int archives = DownloadService.packedArchives();
+                setStatus(archives > 1 ? "Wrote " + archives + " .wua archives" : "Wrote .wua archive", R.color.success);
+            } else {
+                int folders = DownloadService.decryptedFolders();
+                setStatus(folders > 1 ? "Decrypted " + folders + " folders" : "Decryption finished", R.color.success);
+            }
             progressBar.setProgress(100);
         } else {
             setStatus("Finished — saved to " + outputDirectory, R.color.success);
@@ -1112,7 +1171,11 @@ public final class MainActivity extends Activity {
 
     private void pickFolder(int requestCode) {
         if (requestCode == REQUEST_DECRYPT_TREE) {
-            toast("Pick the downloaded title folder, or a folder that contains it");
+            if (packWuaCheckBox.isChecked()) {
+                toast("Pick the title folder to pack; it becomes a .wua and the working files are deleted");
+            } else {
+                toast("Pick the downloaded title folder, or a folder that contains it");
+            }
         }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION

@@ -52,6 +52,7 @@ public final class DownloadService extends Service {
     private static final String EXTRA_DECRYPT = "decrypt_contents";
     private static final String EXTRA_DELETE_ENCRYPTED = "delete_encrypted";
     private static final String EXTRA_FOLDER = "folder";
+    private static final String EXTRA_PACK_WUA = "pack_wua";
 
     // Run state, read by the activity after a run finishes.
     private static volatile boolean running;
@@ -60,6 +61,8 @@ public final class DownloadService extends Service {
     private static volatile int completedTitles;
     private static volatile int failures;
     private static volatile int decryptedFolders;
+    private static volatile int packedArchives;
+    private static volatile boolean packToWUA;
     private static volatile String lastError = "";
     private static volatile String currentTitle = "";
     private static volatile String mode = MODE_DOWNLOAD;
@@ -128,6 +131,8 @@ public final class DownloadService extends Service {
         final String folder = intent.getStringExtra(EXTRA_FOLDER);
         final boolean decryptContents = intent.getBooleanExtra(EXTRA_DECRYPT, true);
         final boolean deleteEncrypted = intent.getBooleanExtra(EXTRA_DELETE_ENCRYPTED, false);
+        final boolean pack = intent.getBooleanExtra(EXTRA_PACK_WUA, false);
+        packToWUA = pack;
 
         startForegroundCompat(buildNotification(MODE_DECRYPT.equals(mode) ? "Decrypting" : "WiiUDownloader",
                 "Getting started...", -1, true, true));
@@ -142,9 +147,9 @@ public final class DownloadService extends Service {
             @Override
             public void run() {
                 if (MODE_DECRYPT.equals(mode)) {
-                    runDecrypt(folder, deleteEncrypted);
+                    runDecrypt(folder, deleteEncrypted, pack);
                 } else {
-                    runDownloads(titles, output, decryptContents, deleteEncrypted);
+                    runDownloads(titles, output, decryptContents, deleteEncrypted, pack);
                 }
             }
         });
@@ -153,7 +158,8 @@ public final class DownloadService extends Service {
 
     // ----------------------------------------------------------- job runners
 
-    private void runDownloads(String titlesJson, String output, boolean decryptContents, boolean deleteEncrypted) {
+    private void runDownloads(String titlesJson, String output, boolean decryptContents, boolean deleteEncrypted,
+                              boolean pack) {
         int failureCount = 0;
         String error = "";
         boolean wasCancelled = false;
@@ -175,7 +181,7 @@ public final class DownloadService extends Service {
                 currentTitle = name.isEmpty() ? titleId : name;
 
                 try {
-                    Mobile.downloadTitle(titleId, version, output, decryptContents, deleteEncrypted);
+                    Mobile.downloadTitle(titleId, version, output, decryptContents, deleteEncrypted, pack);
                     if (!cancelled) {
                         finishedTitleIds.add(titleId);
                     }
@@ -195,7 +201,7 @@ public final class DownloadService extends Service {
         finishRun(failureCount, error, wasCancelled);
     }
 
-    private void runDecrypt(String folder, boolean deleteEncrypted) {
+    private void runDecrypt(String folder, boolean deleteEncrypted, boolean pack) {
         int failureCount = 0;
         String error = "";
         boolean wasCancelled = false;
@@ -207,9 +213,15 @@ public final class DownloadService extends Service {
             if (folder == null || folder.trim().isEmpty()) {
                 throw new IllegalArgumentException("no folder selected");
             }
-            // Decrypt in place: the decrypted files replace the encrypted ones.
             // The core accepts the title folder or a folder that contains it.
-            decryptedFolders = (int) Mobile.decryptPickedFolder(folder, deleteEncrypted);
+            if (pack) {
+                // Decrypt, pack into a .wua and delete the working files, leaving
+                // only the archive next to where the folder was.
+                packedArchives = (int) Mobile.packPickedFolderToWUA(folder, true);
+            } else {
+                // Decrypt in place: the decrypted files replace the encrypted ones.
+                decryptedFolders = (int) Mobile.decryptPickedFolder(folder, deleteEncrypted);
+            }
             completedTitles = 1;
         } catch (Exception runError) {
             failureCount++;
@@ -234,7 +246,11 @@ public final class DownloadService extends Service {
         String title;
         String text;
         if (ok) {
-            title = MODE_DECRYPT.equals(mode) ? "Decryption finished" : "Download finished";
+            if (MODE_DECRYPT.equals(mode)) {
+                title = packToWUA ? "Archive written" : "Decryption finished";
+            } else {
+                title = "Download finished";
+            }
             text = "Done";
         } else if (cancelled) {
             title = "Transfer cancelled";
@@ -383,7 +399,7 @@ public final class DownloadService extends Service {
     // ------------------------------------------------------- start / read API
 
     static void startDownloads(Context context, List<Title> batch, String outputDirectory,
-                              boolean decryptContents, boolean deleteEncrypted) {
+                              boolean decryptContents, boolean deleteEncrypted, boolean pack) {
         JSONArray array = new JSONArray();
         for (Title title : batch) {
             try {
@@ -402,16 +418,18 @@ public final class DownloadService extends Service {
                 .putExtra(EXTRA_TITLES, array.toString())
                 .putExtra(EXTRA_OUTPUT, outputDirectory)
                 .putExtra(EXTRA_DECRYPT, decryptContents)
-                .putExtra(EXTRA_DELETE_ENCRYPTED, deleteEncrypted);
+                .putExtra(EXTRA_DELETE_ENCRYPTED, deleteEncrypted)
+                .putExtra(EXTRA_PACK_WUA, pack);
         launch(context, intent);
     }
 
-    static void startDecrypt(Context context, String folder, boolean deleteEncrypted) {
+    static void startDecrypt(Context context, String folder, boolean deleteEncrypted, boolean pack) {
         resetState(MODE_DECRYPT, 1);
         Intent intent = new Intent(context, DownloadService.class)
                 .putExtra(EXTRA_MODE, MODE_DECRYPT)
                 .putExtra(EXTRA_FOLDER, folder)
-                .putExtra(EXTRA_DELETE_ENCRYPTED, deleteEncrypted);
+                .putExtra(EXTRA_DELETE_ENCRYPTED, deleteEncrypted)
+                .putExtra(EXTRA_PACK_WUA, pack);
         launch(context, intent);
     }
 
@@ -424,6 +442,7 @@ public final class DownloadService extends Service {
         completedTitles = 0;
         failures = 0;
         decryptedFolders = 0;
+        packedArchives = 0;
         cancelled = false;
         lastError = "";
         currentTitle = "";
@@ -461,6 +480,14 @@ public final class DownloadService extends Service {
 
     static int decryptedFolders() {
         return decryptedFolders;
+    }
+
+    static int packedArchives() {
+        return packedArchives;
+    }
+
+    static boolean packToWUA() {
+        return packToWUA;
     }
 
     static String lastMode() {

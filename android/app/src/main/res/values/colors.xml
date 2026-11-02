@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Warm archive palette: espresso surfaces, cream type, terracotta accent and
+     a sage "done" state. Deliberately no saturated blues or glow effects. -->
 <resources>
-    <color name="bg">#0B0F16</color>
-    <color name="surface">#141B26</color>
-    <color name="surface_alt">#1E2735</color>
-    <color name="stroke">#283444</color>
-    <color name="text_primary">#F2F6FC</color>
-    <color name="text_secondary">#8D9BAE</color>
-    <color name="accent">#4F8CFF</color>
-    <color name="accent_dim">#2B4A85</color>
-    <color name="success">#3DDC97</color>
-    <color name="danger">#FF6B81</color>
+    <color name="bg">#12100F</color>
+    <color name="surface">#1A1715</color>
+    <color name="surface_alt">#242019</color>
+    <color name="stroke">#322C26</color>
+    <color name="text_primary">#F4EDE2</color>
+    <color name="text_secondary">#9B8F81</color>
+    <color name="accent">#D2693C</color>
+    <color name="accent_dim">#7E3C22</color>
+    <color name="success">#7FA98B</color>
+    <color name="danger">#CC5C55</color>
 </resources>

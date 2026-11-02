@@ -66,8 +66,8 @@ mkdir -p "$OUT/res" "$OUT/gen"
     --java "$OUT/gen" \
     --min-sdk-version 24 \
     --target-sdk-version 34 \
-    --version-code 5 \
-    --version-name 1.2.2 \
+    --version-code 6 \
+    --version-name 1.3.0 \
     "$OUT"/res/*.flat
 
 echo "==> compiling java"

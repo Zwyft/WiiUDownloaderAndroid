@@ -4,7 +4,10 @@ go 1.26.0
 
 require golang.org/x/crypto v0.57.0
 
-require golang.org/x/sync v0.24.0
+require (
+	github.com/klauspost/compress v1.20.3
+	golang.org/x/sync v0.24.0
+)
 
 require (
 	golang.org/x/mobile v0.0.0-20261011034528-197770444867 // indirect

@@ -23,7 +23,7 @@ import (
 
 const (
 	// AppVersion is shown in the Android UI.
-	AppVersion = "1.2.2-android"
+	AppVersion = "1.3.0-android"
 
 	userAgent = "WiiUDownloader-Android"
 )
@@ -171,10 +171,12 @@ func TitleSize(titleID string, version int) (int64, error) {
 	return int64(size), err
 }
 
-// DownloadTitle downloads and optionally decrypts one title. It blocks until the
-// transfer finishes, so callers run it off the UI thread. An error string is
-// returned through Progress() as well, so the UI can show failures.
-func DownloadTitle(titleID string, version int, outputDirectory string, decrypt bool, deleteEncrypted bool) error {
+// DownloadTitle downloads and optionally decrypts one title. When packWUA is set
+// the decrypted title is packed into a .wua archive and the working folder is
+// removed, so only the archive is left behind. It blocks until the transfer
+// finishes, so callers run it off the UI thread. An error string is returned
+// through Progress() as well, so the UI can show failures.
+func DownloadTitle(titleID string, version int, outputDirectory string, decrypt bool, deleteEncrypted bool, packWUA bool) error {
 	tid, err := parseTitleID(titleID)
 	if err != nil {
 		return err
@@ -200,8 +202,45 @@ func DownloadTitle(titleID string, version int, outputDirectory string, decrypt 
 	}
 
 	runErr := wiiu.DownloadTitle(tidStr, titlePath, version, decrypt, reporter{}, deleteEncrypted, httpClient, "")
+	if runErr == nil && packWUA && decrypt {
+		runErr = packTitleToWUA(titlePath, true)
+	}
 	setResult(runErr)
 	return runErr
+}
+
+// packTitleToWUA packs one decrypted title folder into a .wua archive next to
+// it. With removeSource the folder is deleted once the archive is written, which
+// is what "decrypt into .wua" means: the archive replaces the working files.
+func packTitleToWUA(folder string, removeSource bool) error {
+	wuaPath := folder + ".wua"
+	setPhase("pack", "Packing "+filepath.Base(folder)+".wua")
+
+	if err := wiiu.PackWUA(folder, wuaPath, packProgress, cancelled); err != nil {
+		return err
+	}
+	if removeSource {
+		if err := os.RemoveAll(folder); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// packProgress feeds the archive writer's byte counts into the polled state so
+// the UI can show packing progress with the same bar as downloads.
+func packProgress(done, total int64) {
+	percent := 0
+	if total > 0 {
+		percent = int(float64(done) * 100 / float64(total))
+	}
+	state.mu.Lock()
+	state.phase = "pack"
+	state.total = total
+	state.completed = done
+	state.perFile = make(map[string]int64)
+	state.message = fmt.Sprintf("Packing .wua (%d%%)", percent)
+	state.mu.Unlock()
 }
 
 // DecryptFolder decrypts an already downloaded title directory. An empty
@@ -257,6 +296,67 @@ func DecryptPickedFolder(folder string, deleteEncrypted bool) (int, error) {
 		decrypted++
 	}
 	return decrypted, firstErr
+}
+
+// PackPickedFolderToWUA turns the picked folder into .wua archives: every title
+// folder found is decrypted if it still holds encrypted payloads, packed into
+// <folder>.wua and then deleted, so only the archive remains. It returns how
+// many archives were written.
+func PackPickedFolderToWUA(folder string, removeSource bool) (int, error) {
+	root := strings.TrimSpace(folder)
+	if root == "" {
+		return 0, fmt.Errorf("no folder selected")
+	}
+
+	targets := titleFoldersUnder(root)
+	if len(targets) == 0 {
+		return 0, fmt.Errorf("no title.tmd in %q or its subfolders: pick the downloaded title folder (the one that holds title.tmd)", filepath.Base(root))
+	}
+
+	beginRun("Packing .wua")
+	defer endRun()
+
+	packed := 0
+	var firstErr error
+	for _, target := range targets {
+		if cancelled() {
+			break
+		}
+		if hasEncryptedContents(target) {
+			setPhase("decrypt", "Decrypting "+filepath.Base(target))
+			if err := wiiu.DecryptContents(target, reporter{}, false, target); err != nil {
+				firstErr = fmt.Errorf("%s: %w", filepath.Base(target), err)
+				setResult(firstErr)
+				break
+			}
+		}
+		if err := packTitleToWUA(target, removeSource); err != nil {
+			firstErr = fmt.Errorf("%s: %w", filepath.Base(target), err)
+			setResult(firstErr)
+			break
+		}
+		packed++
+	}
+	return packed, firstErr
+}
+
+// hasEncryptedContents reports whether folder still holds encrypted payloads,
+// i.e. whether it needs decrypting before it can be packed.
+func hasEncryptedContents(folder string) bool {
+	entries, err := os.ReadDir(folder)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.ToLower(entry.Name())
+		if strings.HasSuffix(name, ".app") || strings.HasSuffix(name, ".h3") {
+			return true
+		}
+	}
+	return false
 }
 
 // titleFoldersUnder lists the folders to decrypt for root: root itself when it
