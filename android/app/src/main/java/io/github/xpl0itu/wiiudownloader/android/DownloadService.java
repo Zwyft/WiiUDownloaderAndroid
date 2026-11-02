@@ -75,6 +75,9 @@ public final class DownloadService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // Keep the core's temporary files inside the app sandbox; see
+        // MainActivity for why this is needed on Android.
+        Mobile.setTempDirectory(getCacheDir().getAbsolutePath());
         executor = Executors.newSingleThreadExecutor();
         handler = new Handler(Looper.getMainLooper());
         createChannel();

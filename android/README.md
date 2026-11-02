@@ -60,7 +60,7 @@ v0.23.0 to v0.24.0 as x/mobile requires it.
 
 ## Installing
 
-1. Copy `WiiUDownloader-android-1.2.1.apk` to the phone and open it.
+1. Copy `WiiUDownloader-android-1.2.2.apk` to the phone and open it.
 2. Allow "install unknown apps" for the app you opened it from when prompted.
 
 Minimum Android 7.0 (API 24), target SDK 34, ABIs arm64-v8a, armeabi-v7a and

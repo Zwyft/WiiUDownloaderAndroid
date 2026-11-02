@@ -13,6 +13,18 @@ var (
 	cetkData []byte
 )
 
+// TempDir overrides the directory used for short-lived downloads such as the
+// OSv10 ticket. Empty keeps os.TempDir(). Android apps have to set it: Go's
+// default there is /data/local/tmp, which apps cannot write to.
+var TempDir string
+
+func temporaryDir() string {
+	if TempDir != "" {
+		return TempDir
+	}
+	return os.TempDir()
+}
+
 const (
 	// Embedded certificate chain starts at this range inside the downloaded cetk.
 	CETK_CERT_START_OFFSET = 0x350
@@ -25,7 +37,7 @@ func getDefaultCert(progressReporter ProgressReporter, client *http.Client) ([]b
 	if hasCetkCertData(cetkData) {
 		return cetkData[CETK_CERT_START_OFFSET : CETK_CERT_START_OFFSET+CETK_CERT_SIZE], nil
 	}
-	cetkDir := path.Join(os.TempDir(), "cetk")
+	cetkDir := path.Join(temporaryDir(), "cetk")
 	if err := downloadFile(progressReporter, client, "http://ccs.cdn.c.shop.nintendowifi.net/ccs/download/000500101000400a/cetk", cetkDir, true); err != nil {
 		return nil, err
 	}
@@ -37,6 +49,8 @@ func getDefaultCert(progressReporter ProgressReporter, client *http.Client) ([]b
 	if err := os.Remove(cetkDir); err != nil {
 		return nil, err
 	}
+	// Drop the resume journal the temporary download leaves behind.
+	_ = cleanupPartialDownload(cetkDir)
 
 	if hasCetkCertData(data) {
 		cetkData = data

@@ -23,7 +23,7 @@ import (
 
 const (
 	// AppVersion is shown in the Android UI.
-	AppVersion = "1.2.1-android"
+	AppVersion = "1.2.2-android"
 
 	userAgent = "WiiUDownloader-Android"
 )
@@ -79,6 +79,19 @@ var httpClient = &http.Client{
 // Version reports the binding version.
 func Version() string {
 	return AppVersion
+}
+
+// SetTempDirectory points the core's temporary files at a directory the app can
+// write to. Go resolves os.TempDir() to /data/local/tmp on Android, which apps
+// cannot write, so the first certificate download otherwise fails with a
+// permission error. The app passes its cache directory during startup.
+func SetTempDirectory(dir string) {
+	trimmed := strings.TrimSpace(dir)
+	if trimmed == "" {
+		return
+	}
+	wiiu.TempDir = trimmed
+	_ = os.Setenv("TMPDIR", trimmed)
 }
 
 // ImportTitleDatabaseJSON replaces the in-memory title database. The payload is

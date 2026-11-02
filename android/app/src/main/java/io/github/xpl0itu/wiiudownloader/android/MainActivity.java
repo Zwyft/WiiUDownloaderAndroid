@@ -200,6 +200,9 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        // Go defaults its temp directory to /data/local/tmp on Android, which apps
+        // cannot write; give the core a directory it can use.
+        Mobile.setTempDirectory(getCacheDir().getAbsolutePath());
 
         File defaultDir = new File(getExternalFilesDir(null), "WiiUDownloader");
         outputDirectory = prefs.getString(PREF_OUTPUT_DIR, defaultDir.getAbsolutePath());
