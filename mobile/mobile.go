@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +84,21 @@ func Version() string {
 // with or without dashes) and regions as either a bit mask or a name.
 func ImportTitleDatabaseJSON(data string) (int, error) {
 	entries, err := parseTitleDatabase(data)
+	if err != nil {
+		return 0, err
+	}
+	wiiu.SetTitleDatabase(entries)
+	return len(entries), nil
+}
+
+// ImportEshopCatalogJSON loads the public eShop catalogue published by the
+// nus-info project, which the app downloads when it has no title list yet. The
+// payload is an object keyed by region ("US", "GB", "JP", ...) whose values map
+// title IDs to objects carrying "title_id" and "name". Only those fields are
+// read: descriptions, screenshots and availability data are skipped while the
+// stream is decoded, which keeps the ~8 MB file cheap to import.
+func ImportEshopCatalogJSON(data string) (int, error) {
+	entries, err := parseEshopCatalog(data)
 	if err != nil {
 		return 0, err
 	}
@@ -450,6 +466,105 @@ type rawTitle struct {
 	Version   *int            `json:"version"`
 	KeyType   *int            `json:"key"`
 	TitleType json.RawMessage `json:"title_type"`
+}
+
+// eshopRegion maps a nus-info top-level region key onto the core's region mask.
+func eshopRegion(code string) uint8 {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "JP":
+		return wiiu.MCP_REGION_JAPAN
+	case "US", "CA", "MX", "BR":
+		return wiiu.MCP_REGION_USA
+	case "GB", "FR", "DE", "ES", "IT", "NL", "PT", "RU", "AU", "BE", "AT", "CH", "IE", "SE", "NO", "DK", "FI", "PL", "CZ", "GR", "HU", "RO":
+		return wiiu.MCP_REGION_EUROPE
+	default:
+		return 0
+	}
+}
+
+// eshopCategory classifies a catalogue entry from its title ID, since the eShop
+// listing only knows about games and demos.
+func eshopCategory(tid uint64) uint8 {
+	if uint32(tid>>32) == wiiu.TID_HIGH_DEMO {
+		return wiiu.TITLE_CATEGORY_DEMO
+	}
+	return wiiu.TITLE_CATEGORY_GAME
+}
+
+func parseEshopCatalog(data string) ([]wiiu.TitleEntry, error) {
+	decoder := json.NewDecoder(strings.NewReader(data))
+
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("title list is not valid JSON: %w", err)
+	}
+	if delim, ok := opening.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("title list must be an object keyed by region")
+	}
+
+	entries := make([]wiiu.TitleEntry, 0, 4096)
+	index := make(map[uint64]int, 4096)
+
+	for decoder.More() {
+		regionToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("title list is truncated: %w", err)
+		}
+		regionCode, _ := regionToken.(string)
+		region := eshopRegion(regionCode)
+
+		opening, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("title list is truncated: %w", err)
+		}
+		if delim, ok := opening.(json.Delim); !ok || delim != '{' {
+			return nil, fmt.Errorf("region %q must hold an object of titles", regionCode)
+		}
+
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return nil, fmt.Errorf("title list is truncated: %w", err)
+			}
+			var leaf struct {
+				TitleID string `json:"title_id"`
+				Name    string `json:"name"`
+			}
+			if err := decoder.Decode(&leaf); err != nil {
+				return nil, fmt.Errorf("title entry in %q is invalid: %w", regionCode, err)
+			}
+			tid, err := parseTitleID(leaf.TitleID)
+			if err != nil || strings.TrimSpace(leaf.Name) == "" {
+				continue
+			}
+			if position, ok := index[tid]; ok {
+				// The same title can be listed for several regions; fold them
+				// into one entry so the list shows each game once.
+				entries[position].Region |= region
+				continue
+			}
+			index[tid] = len(entries)
+			entries = append(entries, wiiu.TitleEntry{
+				Name:     strings.TrimSpace(leaf.Name),
+				TitleID:  tid,
+				Region:   region,
+				Category: eshopCategory(tid),
+				Version:  wiiu.VersionLatest,
+			})
+		}
+
+		if _, err := decoder.Token(); err != nil {
+			return nil, fmt.Errorf("title list is truncated: %w", err)
+		}
+	}
+
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("title list has no titles")
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+	})
+	return entries, nil
 }
 
 func parseTitleDatabase(data string) ([]wiiu.TitleEntry, error) {

@@ -6,7 +6,7 @@ uses. The Go library is untouched; a small facade (`../mobile`) is bound with
 
 ```
 mobile/mobile.go                     gomobile facade (JSON in, JSON out)
-android/app/src/main/java/...        MainActivity, Title, TitleAdapter
+android/app/src/main/java/...        MainActivity, DownloadService, Title, TitleAdapter
 android/app/src/main/AndroidManifest.xml
 android/build.sh                     builds a signed debug APK
 ```
@@ -19,7 +19,8 @@ speaks only strings, numbers, booleans and errors:
 | Call | Purpose |
 | --- | --- |
 | `Mobile.version()` | core version |
-| `Mobile.importTitleDatabaseJSON(json)` | load a title list (returns count) |
+| `Mobile.importTitleDatabaseJSON(json)` | load a title list array (returns count) |
+| `Mobile.importEshopCatalogJSON(json)` | load the eShop catalogue format (returns count) |
 | `Mobile.searchTitles(q, category, regionMask, limit)` | JSON array of matches |
 | `Mobile.titleInfo(titleId)` | JSON object for one title ID |
 | `Mobile.titleSize(titleId, version)` | download size in bytes |
@@ -57,7 +58,7 @@ v0.23.0 to v0.24.0 as x/mobile requires it.
 
 ## Installing
 
-1. Copy `WiiUDownloader-android-1.0.0.apk` to the phone and open it.
+1. Copy `WiiUDownloader-android-1.1.0.apk` to the phone and open it.
 2. Allow "install unknown apps" for the app you opened it from when prompted.
 
 Minimum Android 7.0 (API 24), target SDK 34, ABIs arm64-v8a, armeabi-v7a and
@@ -66,6 +67,12 @@ build.
 
 ## Using
 
+- **Title list** downloads the Wii U eShop catalogue once (title IDs, names and
+  regions for every store title, about 8 MB) and stores it in app data, so
+  search works offline afterwards. The list comes from the
+  [nus-info](https://dantheman827.github.io/nus-info/) project, which publishes
+  Nintendo's eShop metadata under CC BY-NC 4.0. A mirror URL can be used instead.
+  The app offers this automatically on first launch while the list is empty.
 - **Add ID** queues a title by ID (hex, e.g. `0005000010101D00`), optionally
   pinning a title version.
 - **Import title database** (⋮ menu) loads a JSON array of
@@ -76,19 +83,33 @@ build.
   regions.
 - Tap rows to queue them, long-press for size/info, then **Download queue**.
 - Output defaults to `Android/data/io.github.xpl0itu.wiiudownloader.android/files/WiiUDownloader`
-  and can be changed with **Folder**. Files are written straight to the
-  filesystem, so a path outside app storage only works if this app can write
-  there (Android scoped storage usually says no).
-- **Decrypt** reproduces the desktop output (`title.tmd`, `*.app`, `.h3`, plus
-  the decrypted/extracted tree). "Delete encrypted after decrypt" matches the
+  and can be changed with **Folder**, which opens the system folder picker.
+- **Decrypt folder** (⋮ menu) also uses the system folder picker and decrypts in
+  place, reproducing the desktop output (`title.tmd`, `*.app`, `.h3`, plus the
+  decrypted/extracted tree). "Delete encrypted after decrypt" matches the
   desktop option.
+- Transfers run in a foreground service with a progress notification (percent,
+  speed, queue position) and a Cancel action, so a screen-off or backgrounded
+  app keeps downloading. Android 13+ asks once for the notification permission;
+  without it the transfer still runs, only silently.
+
+### Folder access
+
+The Go core works on real filesystem paths, so a picked folder is mapped from
+its SAF tree URI (`primary:Download/…` becomes `/storage/emulated/0/Download/…`,
+an SD card UUID becomes its volume root). The app can always read and write its
+own storage. Anything else — `Download`, `Documents`, an SD card — is only
+reachable by path on Android 11+ with **All files access**, so the app asks for
+that permission when the picker chooses such a folder and retries automatically
+on return. Without it, downloads and decryption inside app storage still work.
 
 ## Known limitations
 
-- The upstream title database feed (`napi.v10lator.de`) returns an empty reply,
-  so the app ships with no title list: add titles by ID or import a JSON list.
-  The desktop app's `db.go` build step fails for the same reason.
-- Decrypt-existing-folder takes a typed path rather than a SAF tree URI, because
-  the Go core needs a real filesystem path.
+- The desktop title feed (`napi.v10lator.de`) has been returning an empty reply,
+  so the app no longer depends on it at all: it uses the nus-info eShop
+  catalogue, an imported JSON file, or a title ID. The catalogue covers games,
+  demos and applications, not updates/DLC — those download fine by ID.
+- The list view shows at most 400 matches per search; narrow the query to see
+  more.
 - Downloads use Nintendo's plain-HTTP CDN, so the manifest enables cleartext
   traffic.

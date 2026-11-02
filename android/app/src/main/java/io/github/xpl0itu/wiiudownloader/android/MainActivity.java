@@ -1,15 +1,23 @@
 package io.github.xpl0itu.wiiudownloader.android;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
+import android.provider.DocumentsContract;
+import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -34,9 +42,11 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -53,8 +63,9 @@ import mobile.Mobile;
  * Single-screen Android front end for the WiiUDownloader core.
  *
  * <p>The Go core (bound through gomobile, see mobile/mobile.go) does all
- * downloading and decryption; this activity handles browsing, queueing and
- * progress, polling {@code Mobile.progress()} while a transfer runs.
+ * downloading and decryption. Transfers run inside {@link DownloadService} so
+ * they survive the app being backgrounded; this activity browses titles, builds
+ * the queue and polls {@code Mobile.progress()} for the live numbers.
  */
 public final class MainActivity extends Activity {
 
@@ -62,8 +73,27 @@ public final class MainActivity extends Activity {
     private static final String PREF_OUTPUT_DIR = "output_dir";
     private static final String PREF_DECRYPT = "decrypt";
     private static final String PREF_DELETE_ENCRYPTED = "delete_encrypted";
-    private static final String PREF_DATABASE = "database_json";
+    private static final String PREF_CATALOG_URL = "catalog_url";
+    private static final String PREF_DATABASE = "database_json"; // legacy copy kept in prefs
+
+    /** Title list is stored next to app data, not in preferences: it is megabytes. */
+    private static final String DATABASE_FILE = "titles.json";
+
+    /**
+     * Wii U eShop catalogue published by the nus-info project: title IDs, names
+     * and regions for the whole store. CC BY-NC 4.0, see nus-info's README.
+     */
+    private static final String CATALOG_URL =
+            "https://dantheman827.github.io/nus-info/complete-wup-regionprimaries.json";
+
     private static final int REQUEST_IMPORT_DB = 1001;
+    private static final int REQUEST_DECRYPT_TREE = 1002;
+    private static final int REQUEST_OUTPUT_TREE = 1003;
+    private static final int REQUEST_NOTIFICATIONS = 1004;
+    private static final int REQUEST_STORAGE = 1005;
+
+    /** Cap on rows sent to the list; the catalogue holds thousands of titles. */
+    private static final int RESULT_LIMIT = 400;
 
     private static final String[] CATEGORY_LABELS = {"All types", "Games", "Updates", "DLC", "Demos"};
     // Matches TITLE_CATEGORY_* in the Go core.
@@ -92,9 +122,12 @@ public final class MainActivity extends Activity {
 
     private SharedPreferences prefs;
     private String outputDirectory;
-    private volatile boolean running;
-    private volatile boolean cancelRequested;
     private boolean polling;
+
+    /** Folder waiting for storage access before it can be used. */
+    private String pendingPath;
+    private boolean pendingIsDecrypt;
+    private boolean catalogLoading;
 
     private final Runnable progressPoll = new Runnable() {
         @Override
@@ -124,7 +157,7 @@ public final class MainActivity extends Activity {
                     StringBuilder builder = new StringBuilder();
                     builder.append(progress.optString("title", ""));
                     if (builder.length() > 0) {
-                        builder.append(" \u2014 ");
+                        builder.append(" — ");
                     }
                     builder.append(message.isEmpty() ? "Working..." : message);
                     if (total > 0) {
@@ -139,7 +172,12 @@ public final class MainActivity extends Activity {
                 // A progress snapshot can race with the end of a run; the next
                 // tick or the run's completion handler settles the UI.
             }
-            handler.postDelayed(this, 300);
+
+            if (DownloadService.isRunning()) {
+                handler.postDelayed(this, 300);
+            } else {
+                settleRun();
+            }
         }
     };
 
@@ -158,12 +196,38 @@ public final class MainActivity extends Activity {
 
         loadStoredDatabase();
         refreshList();
+
+        if (DownloadService.isRunning()) {
+            polling = true;
+            updateQueueUi();
+            handler.post(progressPoll);
+        } else if (Mobile.databaseCount() == 0 && !catalogLoading) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    promptForCatalog();
+                }
+            });
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        retryPendingPath();
+        if (DownloadService.isRunning() && !polling) {
+            polling = true;
+            updateQueueUi();
+            handler.post(progressPoll);
+        }
     }
 
     @Override
     protected void onDestroy() {
         polling = false;
         handler.removeCallbacks(progressPoll);
+        // Transfers live in DownloadService, so shutting the UI executor down
+        // does not interrupt a running download.
         executor.shutdownNow();
         super.onDestroy();
     }
@@ -189,7 +253,7 @@ public final class MainActivity extends Activity {
         header.addView(title);
 
         Button menuButton = new Button(this);
-        menuButton.setText("\u22ee");
+        menuButton.setText("⋮");
         menuButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -200,7 +264,7 @@ public final class MainActivity extends Activity {
         root.addView(header);
 
         TextView versionView = new TextView(this);
-        versionView.setText("core " + Mobile.version() + " \u00b7 GPLv3");
+        versionView.setText("core " + Mobile.version() + " · GPLv3");
         versionView.setTextSize(11);
         versionView.setAlpha(0.6f);
         root.addView(versionView);
@@ -266,8 +330,20 @@ public final class MainActivity extends Activity {
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
 
+        Button titlesButton = new Button(this);
+        titlesButton.setText("Title list");
+        titlesButton.setTextSize(12);
+        titlesButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                importCatalog();
+            }
+        });
+        actions.addView(titlesButton);
+
         Button addButton = new Button(this);
         addButton.setText("Add ID");
+        addButton.setTextSize(12);
         addButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -278,16 +354,18 @@ public final class MainActivity extends Activity {
 
         Button folderButton = new Button(this);
         folderButton.setText("Folder");
+        folderButton.setTextSize(12);
         folderButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                showFolderDialog();
+                pickFolder(REQUEST_OUTPUT_TREE);
             }
         });
         actions.addView(folderButton);
 
         Button clearButton = new Button(this);
-        clearButton.setText("Clear queue");
+        clearButton.setText("Clear");
+        clearButton.setTextSize(12);
         clearButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -377,8 +455,7 @@ public final class MainActivity extends Activity {
         cancelButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                cancelRequested = true;
-                Mobile.cancel();
+                DownloadService.requestCancel();
                 statusView.setText("Cancelling...");
             }
         });
@@ -391,24 +468,28 @@ public final class MainActivity extends Activity {
 
     private void showMenu(View anchor) {
         PopupMenu menu = new PopupMenu(this, anchor);
-        menu.getMenu().add(0, 1, 0, "Import title database\u2026");
-        menu.getMenu().add(0, 2, 1, "Decrypt downloaded folder\u2026");
-        menu.getMenu().add(0, 3, 2, "Output folder\u2026");
-        menu.getMenu().add(0, 4, 3, "About");
+        menu.getMenu().add(0, 1, 0, "Download title list…");
+        menu.getMenu().add(0, 2, 1, "Import title list file…");
+        menu.getMenu().add(0, 3, 2, "Decrypt folder…");
+        menu.getMenu().add(0, 4, 3, "Output folder…");
+        menu.getMenu().add(0, 5, 4, "About");
         menu.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
             @Override
             public boolean onMenuItemClick(MenuItem item) {
                 switch (item.getItemId()) {
                     case 1:
-                        importDatabase();
+                        importCatalog();
                         return true;
                     case 2:
-                        showDecryptFolderDialog();
+                        importDatabase();
                         return true;
                     case 3:
-                        showFolderDialog();
+                        pickFolder(REQUEST_DECRYPT_TREE);
                         return true;
                     case 4:
+                        pickFolder(REQUEST_OUTPUT_TREE);
+                        return true;
+                    case 5:
                         showAbout();
                         return true;
                     default:
@@ -428,7 +509,7 @@ public final class MainActivity extends Activity {
 
         List<Title> titles = new ArrayList<>();
         try {
-            String json = Mobile.searchTitles(query, category, region, 0);
+            String json = Mobile.searchTitles(query, category, region, RESULT_LIMIT);
             JSONArray array = new JSONArray(json);
             for (int i = 0; i < array.length(); i++) {
                 titles.add(Title.fromJson(array.getJSONObject(i)));
@@ -440,10 +521,12 @@ public final class MainActivity extends Activity {
         adapter.setItems(titles);
         if (titles.isEmpty()) {
             if (Mobile.databaseCount() == 0) {
-                statusView.setText("No title database loaded. Use Add ID for a title ID, or import a titles JSON from the menu.");
+                statusView.setText("No title list loaded yet. Tap \"Title list\" to download it, or add one title by ID.");
             } else {
                 statusView.setText("No titles match this filter.");
             }
+        } else if (titles.size() >= RESULT_LIMIT) {
+            statusView.setText("Showing the first " + RESULT_LIMIT + " matches — type more of the name to narrow it down.");
         }
     }
 
@@ -457,23 +540,213 @@ public final class MainActivity extends Activity {
     }
 
     private void updateQueueUi() {
+        boolean busy = DownloadService.isRunning();
         Set<String> ids = new LinkedHashSet<>(queue.keySet());
         adapter.setQueued(ids);
         downloadButton.setText("Download queue (" + queue.size() + ")");
-        downloadButton.setEnabled(!queue.isEmpty() && !running);
+        downloadButton.setEnabled(!busy && !queue.isEmpty());
+        cancelButton.setEnabled(busy);
         queueSummaryView.setText(queue.isEmpty()
                 ? "Output: " + outputDirectory
-                : queue.size() + " queued \u00b7 output: " + outputDirectory);
+                : queue.size() + " queued · output: " + outputDirectory);
+    }
+
+    // ------------------------------------------------------------- database
+
+    private File databaseFile() {
+        return new File(getFilesDir(), DATABASE_FILE);
     }
 
     private void loadStoredDatabase() {
-        String stored = prefs.getString(PREF_DATABASE, null);
-        if (stored != null && !stored.isEmpty()) {
+        final File file = databaseFile();
+
+        // Older builds kept the JSON inside preferences; move it to a file.
+        String legacy = prefs.getString(PREF_DATABASE, null);
+        if (!file.isFile() && legacy != null && !legacy.isEmpty()) {
             try {
-                Mobile.importTitleDatabaseJSON(stored);
-            } catch (Exception error) {
-                toast("Stored database could not be loaded: " + error.getMessage());
+                saveDatabase(legacy);
+                prefs.edit().remove(PREF_DATABASE).apply();
+            } catch (Exception ignored) {
+                // Fall through: the file simply stays missing.
             }
+        }
+        if (!file.isFile()) {
+            return;
+        }
+
+        catalogLoading = true;
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                String failure = "";
+                long count = 0;
+                try {
+                    count = importAny(readText(file));
+                } catch (Exception error) {
+                    failure = error.getMessage() == null ? error.toString() : error.getMessage();
+                }
+                final String message = failure;
+                final long loaded = count;
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        catalogLoading = false;
+                        if (!message.isEmpty()) {
+                            statusView.setText("Stored title list could not be loaded: " + message);
+                        } else if (loaded > 0) {
+                            statusView.setText("Loaded " + loaded + " titles from the stored list.");
+                        }
+                        refreshList();
+                    }
+                });
+            }
+        });
+    }
+
+    private void saveDatabase(String json) throws Exception {
+        FileOutputStream output = new FileOutputStream(databaseFile());
+        try {
+            output.write(json.getBytes("UTF-8"));
+        } finally {
+            output.close();
+        }
+    }
+
+    /** Accepts both the eShop catalogue and a plain array of titles. */
+    private long importAny(String json) throws Exception {
+        try {
+            return Mobile.importEshopCatalogJSON(json);
+        } catch (Exception catalogError) {
+            return Mobile.importTitleDatabaseJSON(json);
+        }
+    }
+
+    private void promptForCatalog() {
+        if (isFinishing() || Mobile.databaseCount() > 0) {
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("No title list yet")
+                .setMessage("Search needs a title list. Download the public Wii U eShop catalogue (about 8 MB, one time) now?\n\n"
+                        + "You can also queue a title by its ID without any list.")
+                .setPositiveButton("Download", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        downloadCatalog(CATALOG_URL);
+                    }
+                })
+                .setNeutralButton("Add ID", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        showAddTitleDialog();
+                    }
+                })
+                .setNegativeButton("Later", null)
+                .show();
+    }
+
+    private void importCatalog() {
+        final EditText input = new EditText(this);
+        input.setText(prefs.getString(PREF_CATALOG_URL, CATALOG_URL));
+        input.setSingleLine(false);
+        int padding = dp(16);
+        input.setPadding(padding, padding, padding, padding);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Download title list")
+                .setMessage("Fetches the Wii U eShop catalogue published by the nus-info project "
+                        + "(title IDs, names and regions; CC BY-NC 4.0). Leave the URL unless you have a mirror.")
+                .setView(input)
+                .setPositiveButton("Download", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        String url = input.getText().toString().trim();
+                        if (url.isEmpty()) {
+                            url = CATALOG_URL;
+                        }
+                        prefs.edit().putString(PREF_CATALOG_URL, url).apply();
+                        downloadCatalog(url);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void downloadCatalog(final String url) {
+        if (catalogLoading) {
+            toast("A title list download is already running");
+            return;
+        }
+        catalogLoading = true;
+        statusView.setText("Downloading title list…");
+        toast("Downloading the title list, this takes a moment");
+
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                String failure = "";
+                long count = 0;
+                try {
+                    String json = fetchText(url);
+                    count = importAny(json);
+                    saveDatabase(json);
+                } catch (Exception error) {
+                    failure = error.getMessage() == null ? error.toString() : error.getMessage();
+                }
+                final String message = failure;
+                final long loaded = count;
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        catalogLoading = false;
+                        if (!message.isEmpty()) {
+                            statusView.setText("Title list download failed: " + message);
+                            toast("Title list download failed: " + message);
+                            return;
+                        }
+                        refreshList();
+                        toast("Loaded " + loaded + " titles");
+                    }
+                });
+            }
+        });
+    }
+
+    private String fetchText(String url) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(30000);
+        connection.setReadTimeout(180000);
+        connection.setRequestProperty("User-Agent", "WiiUDownloader-Android");
+        try {
+            int code = connection.getResponseCode();
+            if (code != HttpURLConnection.HTTP_OK) {
+                throw new IllegalStateException("HTTP " + code + " from " + url);
+            }
+            InputStream input = connection.getInputStream();
+            try {
+                ByteArrayOutputStream buffer = new ByteArrayOutputStream(8 * 1024 * 1024);
+                byte[] chunk = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(chunk)) > 0) {
+                    buffer.write(chunk, 0, read);
+                }
+                return buffer.toString("UTF-8");
+            } finally {
+                input.close();
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private void importDatabase() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        try {
+            startActivityForResult(intent, REQUEST_IMPORT_DB);
+        } catch (Exception error) {
+            toast("No file picker available");
         }
     }
 
@@ -537,7 +810,7 @@ public final class MainActivity extends Activity {
     private void showTitleDetails(final Title title) {
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(title.displayName())
-                .setMessage(title.subtitle() + "\n\nFetching size\u2026")
+                .setMessage(title.subtitle() + "\n\nFetching size…")
                 .setPositiveButton("Queue", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int which) {
@@ -569,73 +842,25 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void showFolderDialog() {
-        final EditText input = new EditText(this);
-        input.setText(outputDirectory);
-        input.setSingleLine(false);
-        int padding = dp(16);
-        input.setPadding(padding, padding, padding, padding);
-
-        new AlertDialog.Builder(this)
-                .setTitle("Output folder")
-                .setMessage("Files are written straight to the filesystem, so use a path this app can write to (app storage always works).")
-                .setView(input)
-                .setPositiveButton("Save", new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        String path = input.getText().toString().trim();
-                        if (path.isEmpty()) {
-                            return;
-                        }
-                        outputDirectory = path;
-                        prefs.edit().putString(PREF_OUTPUT_DIR, path).apply();
-                        updateQueueUi();
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void showDecryptFolderDialog() {
-        final EditText input = new EditText(this);
-        input.setHint(outputDirectory);
-        int padding = dp(16);
-        input.setPadding(padding, padding, padding, padding);
-
-        new AlertDialog.Builder(this)
-                .setTitle("Decrypt downloaded folder")
-                .setView(input)
-                .setPositiveButton("Decrypt", new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        final String path = input.getText().toString().trim();
-                        if (path.isEmpty()) {
-                            toast("Enter the folder that holds title.tmd");
-                            return;
-                        }
-                        startDecryptFolder(path);
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
     private void showAbout() {
         new AlertDialog.Builder(this)
                 .setTitle("WiiUDownloader for Android")
                 .setMessage("Downloads Wii U titles from Nintendo's CDN and decrypts them.\n\n"
                         + "Core: " + Mobile.version() + "\n"
-                        + "Titles in database: " + Mobile.databaseCount() + "\n\n"
-                        + "The desktop title database feed is offline, so add titles by ID or import a titles JSON file.\n\n"
-                        + "GPLv3 \u00b7 based on WiiUDownloader by Xpl0itU")
+                        + "Titles in list: " + Mobile.databaseCount() + "\n"
+                        + "Output folder: " + outputDirectory + "\n\n"
+                        + "The desktop title feed (napi.v10lator.de) is offline, so the app downloads the "
+                        + "Wii U eShop catalogue published by the nus-info project "
+                        + "(CC BY-NC 4.0) instead. You can also import a title list file or add a title by ID.\n\n"
+                        + "GPLv3 · based on WiiUDownloader by Xpl0itU")
                 .setPositiveButton("OK", null)
                 .show();
     }
 
-    // ------------------------------------------------------------- downloads
+    // ------------------------------------------------------------- transfers
 
     private void startDownloadRun() {
-        if (running || queue.isEmpty()) {
+        if (DownloadService.isRunning() || queue.isEmpty()) {
             return;
         }
         File directory = new File(outputDirectory);
@@ -646,146 +871,314 @@ public final class MainActivity extends Activity {
 
         final boolean decrypt = decryptCheckBox.isChecked();
         final boolean deleteEncrypted = deleteEncryptedCheckBox.isChecked();
-        final List<Title> batch = new ArrayList<>(queue.values());
+        List<Title> batch = new ArrayList<>(queue.values());
 
-        running = true;
-        cancelRequested = false;
-        downloadButton.setEnabled(false);
-        cancelButton.setEnabled(true);
+        DownloadService.startDownloads(this, batch, outputDirectory, decrypt, deleteEncrypted);
+        ensureNotificationPermission();
+
+        updateQueueUi();
         progressBar.setProgress(0);
         statusView.setText("Starting...");
-
         polling = true;
         handler.post(progressPoll);
-
-        executor.execute(new Runnable() {
-            @Override
-            public void run() {
-                int failures = 0;
-                String lastError = "";
-                for (int i = 0; i < batch.size(); i++) {
-                    if (cancelRequested) {
-                        break;
-                    }
-                    final Title title = batch.get(i);
-                    final int position = i + 1;
-                    handler.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            statusView.setText("Title " + position + "/" + batch.size() + ": " + title.displayName());
-                        }
-                    });
-                    try {
-                        Mobile.downloadTitle(title.titleId, title.version, outputDirectory, decrypt, deleteEncrypted);
-                        if (!cancelRequested) {
-                            queue.remove(title.titleId);
-                        }
-                    } catch (Exception error) {
-                        failures++;
-                        lastError = title.displayName() + ": " + error.getMessage();
-                    }
-                }
-
-                final int totalFailures = failures;
-                final String failureMessage = lastError;
-                handler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        running = false;
-                        polling = false;
-                        handler.removeCallbacks(progressPoll);
-                        cancelButton.setEnabled(false);
-                        updateQueueUi();
-                        if (cancelRequested) {
-                            statusView.setText("Cancelled");
-                        } else if (totalFailures > 0) {
-                            statusView.setText("Finished with " + totalFailures + " failure(s). " + failureMessage);
-                            progressBar.setProgress(0);
-                        } else {
-                            statusView.setText("Finished \u2014 files saved to " + outputDirectory);
-                            progressBar.setProgress(100);
-                        }
-                    }
-                });
-            }
-        });
     }
 
     private void startDecryptFolder(String path) {
-        if (running) {
+        if (DownloadService.isRunning()) {
             toast("A transfer is already running");
             return;
         }
-        final boolean deleteEncrypted = deleteEncryptedCheckBox.isChecked();
+        DownloadService.startDecrypt(this, path, deleteEncryptedCheckBox.isChecked());
+        ensureNotificationPermission();
 
-        running = true;
-        cancelRequested = false;
-        downloadButton.setEnabled(false);
-        cancelButton.setEnabled(true);
+        updateQueueUi();
         progressBar.setProgress(0);
-        statusView.setText("Decrypting " + path + "...");
-
+        statusView.setText("Decrypting " + path + "…");
         polling = true;
         handler.post(progressPoll);
-
-        executor.execute(new Runnable() {
-            @Override
-            public void run() {
-                String failure = "";
-                try {
-                    Mobile.decryptFolder(path, path, deleteEncrypted);
-                } catch (Exception error) {
-                    failure = error.getMessage() == null ? error.toString() : error.getMessage();
-                }
-                final String message = failure;
-                handler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        running = false;
-                        polling = false;
-                        handler.removeCallbacks(progressPoll);
-                        cancelButton.setEnabled(false);
-                        updateQueueUi();
-                        if (!message.isEmpty()) {
-                            statusView.setText("Decryption failed: " + message);
-                        } else {
-                            statusView.setText("Decryption finished");
-                            progressBar.setProgress(100);
-                        }
-                    }
-                });
-            }
-        });
     }
 
-    // ---------------------------------------------------------- db import
+    private void settleRun() {
+        polling = false;
+        handler.removeCallbacks(progressPoll);
 
-    private void importDatabase() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
-        try {
-            startActivityForResult(intent, REQUEST_IMPORT_DB);
-        } catch (Exception error) {
-            toast("No file picker available");
+        List<String> finished = DownloadService.finishedTitleIds();
+        for (String titleId : finished) {
+            queue.remove(titleId);
+        }
+        updateQueueUi();
+
+        String error = DownloadService.lastError();
+        int failures = DownloadService.failures();
+        boolean decryptRun = DownloadService.MODE_DECRYPT.equals(DownloadService.lastMode());
+
+        if (DownloadService.wasCancelled()) {
+            statusView.setText("Cancelled");
+            progressBar.setProgress(0);
+        } else if (failures > 0 || !error.isEmpty()) {
+            statusView.setText("Finished with " + Math.max(failures, 1) + " failure(s). " + error);
+            progressBar.setProgress(0);
+        } else if (decryptRun) {
+            statusView.setText("Decryption finished");
+            progressBar.setProgress(100);
+        } else {
+            statusView.setText("Finished — files saved to " + outputDirectory);
+            progressBar.setProgress(100);
         }
     }
+
+    private void ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
+    }
+
+    // -------------------------------------------------------- folder picking
+
+    private void pickFolder(int requestCode) {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, requestCode);
+        } catch (Exception error) {
+            toast("No folder picker available: " + (error.getMessage() == null ? error.toString() : error.getMessage()));
+        }
+    }
+
+    private void usePickedFolder(int requestCode, Uri treeUri) {
+        try {
+            getContentResolver().takePersistableUriPermission(treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        } catch (Exception ignored) {
+            // Some providers only hand out a one-shot grant; the path still works.
+        }
+
+        String path = resolveTreePath(treeUri);
+        if (path == null) {
+            toast("That folder has no filesystem path. Pick a folder on internal storage or an SD card.");
+            return;
+        }
+
+        if (requestCode == REQUEST_DECRYPT_TREE) {
+            if (!canReadDirectory(path)) {
+                requestStorageAccess(path, true);
+                return;
+            }
+            startDecryptFolder(path);
+        } else if (requestCode == REQUEST_OUTPUT_TREE) {
+            if (!canWriteDirectory(path)) {
+                requestStorageAccess(path, false);
+                return;
+            }
+            applyOutputDirectory(path);
+        }
+    }
+
+    private void applyOutputDirectory(String path) {
+        outputDirectory = path;
+        prefs.edit().putString(PREF_OUTPUT_DIR, path).apply();
+        updateQueueUi();
+        toast("Downloads go to " + path);
+    }
+
+    /**
+     * Maps a SAF tree URI onto a real path. Filesystem paths are what the Go core
+     * works with, so the picker is only a way to choose a directory.
+     */
+    private String resolveTreePath(Uri treeUri) {
+        try {
+            String documentId = DocumentsContract.getTreeDocumentId(treeUri);
+            int colon = documentId.indexOf(':');
+            if (colon < 0) {
+                return null;
+            }
+            String volume = documentId.substring(0, colon);
+            String relative = documentId.substring(colon + 1);
+            File root = volumeRoot(volume);
+            if (root == null) {
+                return null;
+            }
+            File target = relative.isEmpty() ? root : new File(root, relative);
+            return target.getAbsolutePath();
+        } catch (Exception error) {
+            return null;
+        }
+    }
+
+    private File volumeRoot(String volume) {
+        if (volume.isEmpty() || "primary".equalsIgnoreCase(volume)) {
+            return Environment.getExternalStorageDirectory();
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            StorageManager manager = getSystemService(StorageManager.class);
+            if (manager != null) {
+                for (StorageVolume candidate : manager.getStorageVolumes()) {
+                    if (volume.equalsIgnoreCase(candidate.getUuid())) {
+                        File directory = candidate.getDirectory();
+                        if (directory != null) {
+                            return directory;
+                        }
+                    }
+                }
+            }
+        }
+        File fallback = new File("/storage/" + volume);
+        return fallback.isDirectory() ? fallback : null;
+    }
+
+    private boolean canReadDirectory(String path) {
+        File directory = new File(path);
+        if (!directory.isDirectory()) {
+            return false;
+        }
+        File[] children = directory.listFiles();
+        if (children != null) {
+            return true;
+        }
+        // An empty but readable folder is fine; an unreadable one is not.
+        return directory.canRead();
+    }
+
+    private boolean canWriteDirectory(String path) {
+        File directory = new File(path);
+        if (!directory.isDirectory() || !directory.canWrite()) {
+            return false;
+        }
+        File probe = new File(directory, ".wiiudownloader_probe");
+        try {
+            return probe.createNewFile() || probe.exists();
+        } catch (Exception error) {
+            return false;
+        } finally {
+            //noinspection ResultOfMethodCallIgnored
+            probe.delete();
+        }
+    }
+
+    // --------------------------------------------------------- storage access
+
+    private boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestStorageAccess(String path, boolean isDecrypt) {
+        if (hasStorageAccess()) {
+            toast("Cannot use " + path + ": check that the folder exists and is not read-only.");
+            return;
+        }
+        pendingPath = path;
+        pendingIsDecrypt = isDecrypt;
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            requestPermissions(new String[]{
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_STORAGE);
+            return;
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Storage access needed")
+                .setMessage("Android only lets apps read folders they do not own (such as Download or an SD card) "
+                        + "when they have \"All files access\". Grant it, come back, and the folder is used automatically.")
+                .setPositiveButton("Open settings", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        openAllFilesSettings();
+                    }
+                })
+                .setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        pendingPath = null;
+                    }
+                })
+                .show();
+    }
+
+    private void openAllFilesSettings() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception error) {
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+            } catch (Exception ignored) {
+                toast("Could not open the storage permission screen");
+            }
+        }
+    }
+
+    private void retryPendingPath() {
+        if (pendingPath == null || !hasStorageAccess()) {
+            return;
+        }
+        String path = pendingPath;
+        boolean isDecrypt = pendingIsDecrypt;
+        pendingPath = null;
+
+        if (isDecrypt) {
+            if (!canReadDirectory(path)) {
+                toast("Still cannot read " + path);
+                return;
+            }
+            startDecryptFolder(path);
+        } else {
+            if (!canWriteDirectory(path)) {
+                toast("Still cannot write to " + path);
+                return;
+            }
+            applyOutputDirectory(path);
+        }
+    }
+
+    // ------------------------------------------------------------ results/io
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_IMPORT_DB || resultCode != RESULT_OK || data == null || data.getData() == null) {
+        if (resultCode != RESULT_OK || data == null) {
             return;
         }
+
+        if (requestCode == REQUEST_DECRYPT_TREE || requestCode == REQUEST_OUTPUT_TREE) {
+            Uri treeUri = data.getData();
+            if (treeUri != null) {
+                usePickedFolder(requestCode, treeUri);
+            }
+            return;
+        }
+
+        if (requestCode != REQUEST_IMPORT_DB || data.getData() == null) {
+            return;
+        }
+
         Uri uri = data.getData();
         try {
             String json = readText(uri);
-            long count = Mobile.importTitleDatabaseJSON(json);
-            prefs.edit().putString(PREF_DATABASE, json).apply();
+            long count = importAny(json);
+            saveDatabase(json);
             refreshList();
             toast("Loaded " + count + " titles");
         } catch (Exception error) {
             toast("Import failed: " + error.getMessage());
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_STORAGE) {
+            retryPendingPath();
         }
     }
 
@@ -797,6 +1190,21 @@ public final class MainActivity extends Activity {
         try {
             ByteArrayOutputStream buffer = new ByteArrayOutputStream();
             byte[] chunk = new byte[8192];
+            int read;
+            while ((read = input.read(chunk)) > 0) {
+                buffer.write(chunk, 0, read);
+            }
+            return buffer.toString("UTF-8");
+        } finally {
+            input.close();
+        }
+    }
+
+    private String readText(File file) throws Exception {
+        FileInputStream input = new FileInputStream(file);
+        try {
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream((int) Math.max(1024L, file.length()));
+            byte[] chunk = new byte[64 * 1024];
             int read;
             while ((read = input.read(chunk)) > 0) {
                 buffer.write(chunk, 0, read);
