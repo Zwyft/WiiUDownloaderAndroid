@@ -8,6 +8,8 @@ uses. The Go library is untouched; a small facade (`../mobile`) is bound with
 mobile/mobile.go                     gomobile facade (JSON in, JSON out)
 android/app/src/main/java/...        MainActivity, DownloadService, Title, TitleAdapter
 android/app/src/main/AndroidManifest.xml
+android/app/src/main/res/values      dark theme palette and AppTheme
+android/app/src/main/res/drawable    rounded progress bar
 android/build.sh                     builds a signed debug APK
 ```
 
@@ -58,7 +60,7 @@ v0.23.0 to v0.24.0 as x/mobile requires it.
 
 ## Installing
 
-1. Copy `WiiUDownloader-android-1.1.0.apk` to the phone and open it.
+1. Copy `WiiUDownloader-android-1.2.0.apk` to the phone and open it.
 2. Allow "install unknown apps" for the app you opened it from when prompted.
 
 Minimum Android 7.0 (API 24), target SDK 34, ABIs arm64-v8a, armeabi-v7a and
@@ -102,6 +104,27 @@ own storage. Anything else — `Download`, `Documents`, an SD card — is only
 reachable by path on Android 11+ with **All files access**, so the app asks for
 that permission when the picker chooses such a folder and retries automatically
 on return. Without it, downloads and decryption inside app storage still work.
+
+## Look and feel
+
+The UI is built in code — the app links only the platform framework, so there
+is no AndroidX or Material Components dependency — on top of a small design
+system:
+
+- `res/values/colors.xml` holds the dark palette: background, two surface
+  levels, stroke, one blue accent, success and danger.
+- `res/values/styles.xml` defines `AppTheme`, which colours the window, status
+  and navigation bars and the control accent; the manifest references it.
+- `res/drawable/progress_horizontal.xml` is the rounded transfer bar.
+- Pills, cards, chips and the queue indicator are `GradientDrawable` and
+  `StateListDrawable` shapes built at runtime, so they get press states without
+  extra drawables per widget.
+
+The screen reads top to bottom as: header with the core version, rounded search
+field, filter chips for type and region, the title list as cards with a check
+badge per queued title, decrypt/delete toggles, a transfer card (status,
+progress, queue summary and output folder), the primary Download/Cancel pair,
+and a row of quick actions (title list, add ID, folder, decrypt, clear).
 
 ## Known limitations
 

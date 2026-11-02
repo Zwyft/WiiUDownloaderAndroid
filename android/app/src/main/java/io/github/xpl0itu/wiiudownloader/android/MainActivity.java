@@ -7,7 +7,12 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -21,19 +26,19 @@ import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.view.Gravity;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
-import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -66,6 +71,10 @@ import mobile.Mobile;
  * downloading and decryption. Transfers run inside {@link DownloadService} so
  * they survive the app being backgrounded; this activity browses titles, builds
  * the queue and polls {@code Mobile.progress()} for the live numbers.
+ *
+ * <p>The UI is built in code against {@code AppTheme} (dark surfaces, one accent
+ * colour, rounded pills) rather than AndroidX/Material, because the app links
+ * only the platform framework.
  */
 public final class MainActivity extends Activity {
 
@@ -95,7 +104,7 @@ public final class MainActivity extends Activity {
     /** Cap on rows sent to the list; the catalogue holds thousands of titles. */
     private static final int RESULT_LIMIT = 400;
 
-    private static final String[] CATEGORY_LABELS = {"All types", "Games", "Updates", "DLC", "Demos"};
+    private static final String[] CATEGORY_LABELS = {"All", "Games", "Updates", "DLC", "Demos"};
     // Matches TITLE_CATEGORY_* in the Go core.
     private static final int[] CATEGORY_VALUES = {4, 0, 1, 2, 3};
 
@@ -104,17 +113,21 @@ public final class MainActivity extends Activity {
     private static final int[] REGION_VALUES = {0, 2, 4, 1};
 
     private EditText searchBox;
-    private Spinner categorySpinner;
-    private Spinner regionSpinner;
     private ListView listView;
+    private TextView emptyStateView;
     private TextView statusView;
     private TextView queueSummaryView;
     private ProgressBar progressBar;
-    private Button downloadButton;
-    private Button cancelButton;
+    private TextView downloadButton;
+    private TextView cancelButton;
     private CheckBox decryptCheckBox;
     private CheckBox deleteEncryptedCheckBox;
     private TitleAdapter adapter;
+
+    private final List<TextView> categoryChips = new ArrayList<>();
+    private final List<TextView> regionChips = new ArrayList<>();
+    private int categoryIndex;
+    private int regionIndex;
 
     private final Map<String, Title> queue = new LinkedHashMap<>();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -145,28 +158,28 @@ public final class MainActivity extends Activity {
                 String error = progress.optString("error", "");
 
                 if ("done".equals(phase)) {
-                    statusView.setText("Finished");
+                    setStatus("Finished", R.color.text_primary);
                 } else if ("error".equals(phase) || (!error.isEmpty() && !"idle".equals(phase))) {
-                    statusView.setText("Error: " + error);
+                    setStatus("Error: " + error, R.color.danger);
                 } else if ("cancelled".equals(phase)) {
-                    statusView.setText("Cancelled");
+                    setStatus("Cancelled", R.color.text_secondary);
                 } else {
                     long downloaded = progress.optLong("downloaded", 0L);
                     long total = progress.optLong("total", 0L);
                     long speed = progress.optLong("speed", 0L);
                     StringBuilder builder = new StringBuilder();
-                    builder.append(progress.optString("title", ""));
-                    if (builder.length() > 0) {
-                        builder.append(" — ");
+                    String title = progress.optString("title", "");
+                    if (!title.isEmpty()) {
+                        builder.append(title).append(" — ");
                     }
-                    builder.append(message.isEmpty() ? "Working..." : message);
+                    builder.append(message.isEmpty() ? "Working…" : message);
                     if (total > 0) {
                         builder.append(String.format(Locale.US, "  %s / %s", formatBytes(downloaded), formatBytes(total)));
                     }
                     if (speed > 0) {
                         builder.append("  ").append(formatBytes(speed)).append("/s");
                     }
-                    statusView.setText(builder.toString());
+                    setStatus(builder.toString(), R.color.text_primary);
                 }
             } catch (Exception ignored) {
                 // A progress snapshot can race with the end of a run; the next
@@ -180,6 +193,8 @@ public final class MainActivity extends Activity {
             }
         }
     };
+
+    // ------------------------------------------------------------- lifecycle
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -237,42 +252,74 @@ public final class MainActivity extends Activity {
     private void buildLayout() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        int padding = dp(12);
-        root.setPadding(padding, padding, padding, padding);
-        root.setBackgroundColor(0xFFFAFAFA);
+        root.setBackgroundColor(color(R.color.bg));
+        root.setPadding(dp(16), dp(14), dp(16), dp(12));
+        root.setFitsSystemWindows(true);
 
+        root.addView(buildHeader());
+        root.addView(buildSearchField());
+        root.addView(buildFilterRow());
+        root.addView(buildListArea());
+        root.addView(buildToggles());
+        root.addView(buildTransferCard());
+        root.addView(buildRunRow());
+        root.addView(buildQuickActions());
+
+        setContentView(root);
+        updateQueueUi();
+    }
+
+    private View buildHeader() {
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(0, 0, 0, dp(14));
 
-        TextView title = new TextView(this);
-        title.setText("WiiUDownloader");
-        title.setTextSize(20);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        header.addView(title);
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        titles.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button menuButton = new Button(this);
+        TextView title = text("WiiUDownloader", 22, R.color.text_primary);
+        title.setTypeface(medium());
+        titles.addView(title);
+
+        TextView subtitle = text("Wii U titles · core " + Mobile.version(), 11, R.color.text_secondary);
+        subtitle.setLetterSpacing(0.02f);
+        LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        subtitleParams.topMargin = dp(2);
+        subtitle.setLayoutParams(subtitleParams);
+        titles.addView(subtitle);
+        header.addView(titles);
+
+        TextView menuButton = new TextView(this);
         menuButton.setText("⋮");
+        menuButton.setTextSize(20);
+        menuButton.setTextColor(color(R.color.text_primary));
+        menuButton.setGravity(Gravity.CENTER);
+        menuButton.setBackground(pressable(color(R.color.surface_alt), color(R.color.stroke), 22));
         menuButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 showMenu(view);
             }
         });
+        LinearLayout.LayoutParams menuParams = new LinearLayout.LayoutParams(dp(44), dp(44));
+        menuButton.setLayoutParams(menuParams);
         header.addView(menuButton);
-        root.addView(header);
+        return header;
+    }
 
-        TextView versionView = new TextView(this);
-        versionView.setText("core " + Mobile.version() + " · GPLv3");
-        versionView.setTextSize(11);
-        versionView.setAlpha(0.6f);
-        root.addView(versionView);
-
+    private View buildSearchField() {
         searchBox = new EditText(this);
-        searchBox.setHint("Search name or title ID");
+        searchBox.setHint("Search titles or a title ID");
+        searchBox.setHintTextColor(color(R.color.text_secondary));
+        searchBox.setTextColor(color(R.color.text_primary));
+        searchBox.setTextSize(15);
         searchBox.setSingleLine(true);
         searchBox.setInputType(InputType.TYPE_CLASS_TEXT);
+        searchBox.setBackground(outline(color(R.color.surface), color(R.color.stroke), 16));
+        searchBox.setPadding(dp(14), dp(12), dp(14), dp(12));
         searchBox.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {
@@ -287,122 +334,104 @@ public final class MainActivity extends Activity {
                 refreshList();
             }
         });
-        root.addView(searchBox);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.bottomMargin = dp(12);
+        searchBox.setLayoutParams(params);
+        return searchBox;
+    }
 
-        LinearLayout filterRow = new LinearLayout(this);
-        filterRow.setOrientation(LinearLayout.HORIZONTAL);
+    private View buildFilterRow() {
+        LinearLayout filters = new LinearLayout(this);
+        filters.setOrientation(LinearLayout.VERTICAL);
 
-        categorySpinner = new Spinner(this);
-        ArrayAdapter<String> categoryAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, CATEGORY_LABELS);
-        categoryAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        categorySpinner.setAdapter(categoryAdapter);
-        categorySpinner.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        categorySpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                refreshList();
-            }
+        filters.addView(chipScroller(CATEGORY_LABELS, categoryChips, true));
+        filters.addView(chipScroller(REGION_LABELS, regionChips, false));
 
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {
-            }
-        });
-        filterRow.addView(categorySpinner);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.bottomMargin = dp(6);
+        filters.setLayoutParams(params);
+        return filters;
+    }
 
-        regionSpinner = new Spinner(this);
-        ArrayAdapter<String> regionAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, REGION_LABELS);
-        regionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        regionSpinner.setAdapter(regionAdapter);
-        regionSpinner.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        regionSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                refreshList();
-            }
+    private View chipScroller(String[] labels, final List<TextView> target, final boolean categoryRow) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < labels.length; i++) {
+            final int index = i;
+            TextView chip = new TextView(this);
+            chip.setText(labels[i]);
+            chip.setTextSize(12);
+            chip.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            params.rightMargin = dp(8);
+            chip.setLayoutParams(params);
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    if (categoryRow) {
+                        selectCategory(index);
+                    } else {
+                        selectRegion(index);
+                    }
+                }
+            });
+            styleChip(chip, i == 0);
+            target.add(chip);
+            row.addView(chip);
+        }
 
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {
-            }
-        });
-        filterRow.addView(regionSpinner);
-        root.addView(filterRow);
+        HorizontalScrollView scroller = new HorizontalScrollView(this);
+        scroller.setHorizontalScrollBarEnabled(false);
+        scroller.setClipToPadding(false);
+        scroller.addView(row);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.bottomMargin = dp(8);
+        scroller.setLayoutParams(params);
+        return scroller;
+    }
 
-        LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
+    private void selectCategory(int index) {
+        categoryIndex = index;
+        for (int i = 0; i < categoryChips.size(); i++) {
+            styleChip(categoryChips.get(i), i == index);
+        }
+        refreshList();
+    }
 
-        Button titlesButton = new Button(this);
-        titlesButton.setText("Title list");
-        titlesButton.setTextSize(12);
-        titlesButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                importCatalog();
-            }
-        });
-        actions.addView(titlesButton);
+    private void selectRegion(int index) {
+        regionIndex = index;
+        for (int i = 0; i < regionChips.size(); i++) {
+            styleChip(regionChips.get(i), i == index);
+        }
+        refreshList();
+    }
 
-        Button addButton = new Button(this);
-        addButton.setText("Add ID");
-        addButton.setTextSize(12);
-        addButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                showAddTitleDialog();
-            }
-        });
-        actions.addView(addButton);
+    private void styleChip(TextView chip, boolean selected) {
+        chip.setTypeface(selected ? medium() : Typeface.DEFAULT);
+        chip.setTextColor(selected ? color(R.color.bg) : color(R.color.text_secondary));
+        chip.setBackground(selected
+                ? pressable(color(R.color.accent), color(R.color.accent_dim), 18)
+                : pressable(color(R.color.surface_alt), color(R.color.stroke), 18));
+        chip.setPadding(dp(14), dp(7), dp(14), dp(7));
+    }
 
-        Button folderButton = new Button(this);
-        folderButton.setText("Folder");
-        folderButton.setTextSize(12);
-        folderButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                pickFolder(REQUEST_OUTPUT_TREE);
-            }
-        });
-        actions.addView(folderButton);
-
-        Button clearButton = new Button(this);
-        clearButton.setText("Clear");
-        clearButton.setTextSize(12);
-        clearButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                queue.clear();
-                updateQueueUi();
-            }
-        });
-        actions.addView(clearButton);
-        root.addView(actions);
-
-        LinearLayout options = new LinearLayout(this);
-        options.setOrientation(LinearLayout.HORIZONTAL);
-        options.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        decryptCheckBox = new CheckBox(this);
-        decryptCheckBox.setText("Decrypt");
-        decryptCheckBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(android.widget.CompoundButton buttonView, boolean isChecked) {
-                prefs.edit().putBoolean(PREF_DECRYPT, isChecked).apply();
-            }
-        });
-        options.addView(decryptCheckBox);
-
-        deleteEncryptedCheckBox = new CheckBox(this);
-        deleteEncryptedCheckBox.setText("Delete encrypted after decrypt");
-        deleteEncryptedCheckBox.setTextSize(12);
-        deleteEncryptedCheckBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(android.widget.CompoundButton buttonView, boolean isChecked) {
-                prefs.edit().putBoolean(PREF_DELETE_ENCRYPTED, isChecked).apply();
-            }
-        });
-        options.addView(deleteEncryptedCheckBox);
-        root.addView(options);
+    private View buildListArea() {
+        FrameLayout container = new FrameLayout(this);
+        container.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         listView = new ListView(this);
-        listView.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        listView.setDivider(null);
+        listView.setDividerHeight(0);
+        listView.setSelector(new ColorDrawable(0x00000000));
+        listView.setCacheColorHint(0x00000000);
+        listView.setClipToPadding(false);
+        listView.setPadding(0, dp(2), 0, dp(8));
+        listView.setVerticalScrollBarEnabled(false);
         adapter = new TitleAdapter(this);
         listView.setAdapter(adapter);
         listView.setOnItemClickListener(new AdapterView.OnItemClickListener() {
@@ -418,52 +447,173 @@ public final class MainActivity extends Activity {
                 return true;
             }
         });
-        root.addView(listView);
 
-        queueSummaryView = new TextView(this);
-        queueSummaryView.setTextSize(12);
-        queueSummaryView.setAlpha(0.7f);
-        root.addView(queueSummaryView);
+        emptyStateView = text("", 13, R.color.text_secondary);
+        emptyStateView.setGravity(Gravity.CENTER);
+        emptyStateView.setPadding(dp(24), dp(24), dp(24), dp(24));
 
-        statusView = new TextView(this);
-        statusView.setTextSize(12);
-        statusView.setText("Ready");
-        root.addView(statusView);
+        container.addView(listView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        container.addView(emptyStateView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listView.setEmptyView(emptyStateView);
+        return container;
+    }
+
+    private View buildToggles() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        decryptCheckBox = toggle("Decrypt", PREF_DECRYPT);
+        decryptCheckBox.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(decryptCheckBox);
+
+        deleteEncryptedCheckBox = toggle("Delete encrypted", PREF_DELETE_ENCRYPTED);
+        deleteEncryptedCheckBox.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(deleteEncryptedCheckBox);
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.bottomMargin = dp(10);
+        row.setLayoutParams(params);
+        return row;
+    }
+
+    private CheckBox toggle(String label, final String prefKey) {
+        CheckBox box = new CheckBox(this);
+        box.setText(label);
+        box.setTextSize(11);
+        box.setTextColor(color(R.color.text_secondary));
+        box.setButtonTintList(tint(R.color.accent));
+        box.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(android.widget.CompoundButton buttonView, boolean isChecked) {
+                prefs.edit().putBoolean(prefKey, isChecked).apply();
+            }
+        });
+        return box;
+    }
+
+    private View buildTransferCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(outline(color(R.color.surface), color(R.color.stroke), 18));
+        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cardParams.bottomMargin = dp(10);
+        card.setLayoutParams(cardParams);
+
+        TextView label = text("TRANSFER", 10, R.color.text_secondary);
+        label.setLetterSpacing(0.14f);
+        label.setTypeface(medium());
+        card.addView(label);
+
+        statusView = text("Ready", 13, R.color.text_primary);
+        statusView.setMaxLines(2);
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        statusParams.topMargin = dp(4);
+        statusView.setLayoutParams(statusParams);
+        card.addView(statusView);
 
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgress(0);
-        root.addView(progressBar);
+        Drawable track = getResources().getDrawable(R.drawable.progress_horizontal, getTheme());
+        progressBar.setProgressDrawable(track);
+        LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(8));
+        barParams.topMargin = dp(10);
+        barParams.bottomMargin = dp(8);
+        progressBar.setLayoutParams(barParams);
+        card.addView(progressBar);
 
-        LinearLayout runRow = new LinearLayout(this);
-        runRow.setOrientation(LinearLayout.HORIZONTAL);
+        queueSummaryView = text("", 11, R.color.text_secondary);
+        card.addView(queueSummaryView);
+        return card;
+    }
 
-        downloadButton = new Button(this);
-        downloadButton.setText("Download queue");
-        downloadButton.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+    private View buildRunRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        downloadButton = pill("Download queue (0)", R.color.accent, R.color.bg);
+        LinearLayout.LayoutParams downloadParams = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        downloadParams.rightMargin = dp(8);
+        downloadButton.setLayoutParams(downloadParams);
         downloadButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 startDownloadRun();
             }
         });
-        runRow.addView(downloadButton);
+        row.addView(downloadButton);
 
-        cancelButton = new Button(this);
-        cancelButton.setText("Cancel");
+        cancelButton = pill("Cancel", R.color.surface_alt, R.color.text_secondary);
+        cancelButton.setLayoutParams(new LinearLayout.LayoutParams(dp(104), dp(48)));
         cancelButton.setEnabled(false);
         cancelButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 DownloadService.requestCancel();
-                statusView.setText("Cancelling...");
+                setStatus("Cancelling…", R.color.text_secondary);
             }
         });
-        runRow.addView(cancelButton);
-        root.addView(runRow);
+        row.addView(cancelButton);
 
-        setContentView(root);
-        updateQueueUi();
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.bottomMargin = dp(10);
+        row.setLayoutParams(params);
+        return row;
+    }
+
+    private View buildQuickActions() {
+        final String[] labels = {"Title list", "Add ID", "Folder", "Decrypt", "Clear"};
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < labels.length; i++) {
+            final int action = i;
+            TextView chip = text(labels[i], 12, R.color.text_secondary);
+            chip.setGravity(Gravity.CENTER);
+            chip.setBackground(pressable(color(R.color.surface_alt), color(R.color.stroke), 18));
+            chip.setPadding(dp(12), dp(8), dp(12), dp(8));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            params.rightMargin = dp(8);
+            chip.setLayoutParams(params);
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    switch (action) {
+                        case 0:
+                            importCatalog();
+                            break;
+                        case 1:
+                            showAddTitleDialog();
+                            break;
+                        case 2:
+                            pickFolder(REQUEST_OUTPUT_TREE);
+                            break;
+                        case 3:
+                            pickFolder(REQUEST_DECRYPT_TREE);
+                            break;
+                        default:
+                            queue.clear();
+                            updateQueueUi();
+                            break;
+                    }
+                }
+            });
+            row.addView(chip);
+        }
+
+        HorizontalScrollView scroller = new HorizontalScrollView(this);
+        scroller.setHorizontalScrollBarEnabled(false);
+        scroller.addView(row);
+        return scroller;
     }
 
     private void showMenu(View anchor) {
@@ -503,8 +653,8 @@ public final class MainActivity extends Activity {
     // ------------------------------------------------------------ title list
 
     private void refreshList() {
-        int category = CATEGORY_VALUES[Math.max(0, categorySpinner.getSelectedItemPosition())];
-        int region = REGION_VALUES[Math.max(0, regionSpinner.getSelectedItemPosition())];
+        int category = CATEGORY_VALUES[Math.max(0, Math.min(categoryIndex, CATEGORY_VALUES.length - 1))];
+        int region = REGION_VALUES[Math.max(0, Math.min(regionIndex, REGION_VALUES.length - 1))];
         String query = searchBox.getText().toString();
 
         List<Title> titles = new ArrayList<>();
@@ -519,14 +669,19 @@ public final class MainActivity extends Activity {
         }
 
         adapter.setItems(titles);
-        if (titles.isEmpty()) {
+
+        if (emptyStateView != null) {
             if (Mobile.databaseCount() == 0) {
-                statusView.setText("No title list loaded yet. Tap \"Title list\" to download it, or add one title by ID.");
+                emptyStateView.setText("No title list yet.\nTap “Title list” to download the eShop catalogue, or add a title ID.");
             } else {
-                statusView.setText("No titles match this filter.");
+                emptyStateView.setText("No titles match this filter.");
             }
-        } else if (titles.size() >= RESULT_LIMIT) {
-            statusView.setText("Showing the first " + RESULT_LIMIT + " matches — type more of the name to narrow it down.");
+        }
+
+        if (titles.size() >= RESULT_LIMIT) {
+            queueSummaryView.setText("Showing the first " + RESULT_LIMIT + " matches — narrow the search to see more.");
+        } else if (queue.isEmpty()) {
+            queueSummaryView.setText("Output: " + outputDirectory);
         }
     }
 
@@ -541,14 +696,22 @@ public final class MainActivity extends Activity {
 
     private void updateQueueUi() {
         boolean busy = DownloadService.isRunning();
+        boolean canDownload = !busy && !queue.isEmpty();
         Set<String> ids = new LinkedHashSet<>(queue.keySet());
         adapter.setQueued(ids);
         downloadButton.setText("Download queue (" + queue.size() + ")");
-        downloadButton.setEnabled(!busy && !queue.isEmpty());
+        downloadButton.setEnabled(canDownload);
+        downloadButton.setAlpha(canDownload ? 1f : 0.45f);
         cancelButton.setEnabled(busy);
+        cancelButton.setAlpha(busy ? 1f : 0.45f);
         queueSummaryView.setText(queue.isEmpty()
                 ? "Output: " + outputDirectory
                 : queue.size() + " queued · output: " + outputDirectory);
+    }
+
+    private void setStatus(String message, int colorRes) {
+        statusView.setText(message);
+        statusView.setTextColor(color(colorRes));
     }
 
     // ------------------------------------------------------------- database
@@ -592,9 +755,9 @@ public final class MainActivity extends Activity {
                     public void run() {
                         catalogLoading = false;
                         if (!message.isEmpty()) {
-                            statusView.setText("Stored title list could not be loaded: " + message);
+                            setStatus("Stored title list could not be loaded: " + message, R.color.danger);
                         } else if (loaded > 0) {
-                            statusView.setText("Loaded " + loaded + " titles from the stored list.");
+                            setStatus("Loaded " + loaded + " titles.", R.color.text_secondary);
                         }
                         refreshList();
                     }
@@ -646,11 +809,7 @@ public final class MainActivity extends Activity {
     }
 
     private void importCatalog() {
-        final EditText input = new EditText(this);
-        input.setText(prefs.getString(PREF_CATALOG_URL, CATALOG_URL));
-        input.setSingleLine(false);
-        int padding = dp(16);
-        input.setPadding(padding, padding, padding, padding);
+        final EditText input = dialogInput(prefs.getString(PREF_CATALOG_URL, CATALOG_URL));
 
         new AlertDialog.Builder(this)
                 .setTitle("Download title list")
@@ -678,7 +837,7 @@ public final class MainActivity extends Activity {
             return;
         }
         catalogLoading = true;
-        statusView.setText("Downloading title list…");
+        setStatus("Downloading title list…", R.color.text_primary);
         toast("Downloading the title list, this takes a moment");
 
         executor.execute(new Runnable() {
@@ -700,11 +859,12 @@ public final class MainActivity extends Activity {
                     public void run() {
                         catalogLoading = false;
                         if (!message.isEmpty()) {
-                            statusView.setText("Title list download failed: " + message);
+                            setStatus("Title list download failed: " + message, R.color.danger);
                             toast("Title list download failed: " + message);
                             return;
                         }
                         refreshList();
+                        setStatus("Loaded " + loaded + " titles.", R.color.success);
                         toast("Loaded " + loaded + " titles");
                     }
                 });
@@ -755,18 +915,15 @@ public final class MainActivity extends Activity {
     private void showAddTitleDialog() {
         LinearLayout container = new LinearLayout(this);
         container.setOrientation(LinearLayout.VERTICAL);
-        int padding = dp(16);
-        container.setPadding(padding, padding, padding, padding);
+        int padding = dp(20);
+        container.setPadding(padding, dp(8), padding, 0);
 
-        final EditText idBox = new EditText(this);
+        final EditText idBox = dialogInput("");
         idBox.setHint("0005000010101d00");
-        idBox.setSingleLine(true);
-        idBox.setInputType(InputType.TYPE_CLASS_TEXT);
         container.addView(idBox);
 
-        final EditText versionBox = new EditText(this);
+        final EditText versionBox = dialogInput("");
         versionBox.setHint("Title version (blank = latest)");
-        versionBox.setSingleLine(true);
         versionBox.setInputType(InputType.TYPE_CLASS_NUMBER);
         container.addView(versionBox);
 
@@ -781,6 +938,16 @@ public final class MainActivity extends Activity {
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    private EditText dialogInput(String value) {
+        EditText input = new EditText(this);
+        input.setText(value);
+        input.setTextSize(14);
+        input.setSingleLine(false);
+        input.setBackground(outline(color(R.color.surface_alt), color(R.color.stroke), 12));
+        input.setPadding(dp(12), dp(10), dp(12), dp(10));
+        return input;
     }
 
     private void addTitleFromId(String rawId, String rawVersion) {
@@ -878,7 +1045,7 @@ public final class MainActivity extends Activity {
 
         updateQueueUi();
         progressBar.setProgress(0);
-        statusView.setText("Starting...");
+        setStatus("Starting…", R.color.text_primary);
         polling = true;
         handler.post(progressPoll);
     }
@@ -893,7 +1060,7 @@ public final class MainActivity extends Activity {
 
         updateQueueUi();
         progressBar.setProgress(0);
-        statusView.setText("Decrypting " + path + "…");
+        setStatus("Decrypting " + new File(path).getName() + "…", R.color.text_primary);
         polling = true;
         handler.post(progressPoll);
     }
@@ -913,16 +1080,16 @@ public final class MainActivity extends Activity {
         boolean decryptRun = DownloadService.MODE_DECRYPT.equals(DownloadService.lastMode());
 
         if (DownloadService.wasCancelled()) {
-            statusView.setText("Cancelled");
+            setStatus("Cancelled", R.color.text_secondary);
             progressBar.setProgress(0);
         } else if (failures > 0 || !error.isEmpty()) {
-            statusView.setText("Finished with " + Math.max(failures, 1) + " failure(s). " + error);
+            setStatus("Finished with " + Math.max(failures, 1) + " failure(s). " + error, R.color.danger);
             progressBar.setProgress(0);
         } else if (decryptRun) {
-            statusView.setText("Decryption finished");
+            setStatus("Decryption finished", R.color.success);
             progressBar.setProgress(100);
         } else {
-            statusView.setText("Finished — files saved to " + outputDirectory);
+            setStatus("Finished — saved to " + outputDirectory, R.color.success);
             progressBar.setProgress(100);
         }
     }
@@ -1213,6 +1380,59 @@ public final class MainActivity extends Activity {
         } finally {
             input.close();
         }
+    }
+
+    // --------------------------------------------------------------- widgets
+
+    private TextView pill(String label, int backgroundRes, int textRes) {
+        TextView view = text(label, 14, textRes);
+        view.setTypeface(medium());
+        view.setGravity(Gravity.CENTER);
+        view.setBackground(pressable(color(backgroundRes), color(R.color.stroke), 16));
+        view.setClickable(true);
+        view.setFocusable(true);
+        return view;
+    }
+
+    private TextView text(String value, float sizeSp, int colorRes) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        view.setTextSize(sizeSp);
+        view.setTextColor(color(colorRes));
+        return view;
+    }
+
+    private Typeface medium() {
+        return Typeface.create("sans-serif-medium", Typeface.NORMAL);
+    }
+
+    private int color(int colorRes) {
+        return getResources().getColor(colorRes, getTheme());
+    }
+
+    private GradientDrawable fill(int fillColor, float radiusDp) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setShape(GradientDrawable.RECTANGLE);
+        drawable.setColor(fillColor);
+        drawable.setCornerRadius(radiusDp * getResources().getDisplayMetrics().density);
+        return drawable;
+    }
+
+    private GradientDrawable outline(int fillColor, int strokeColor, float radiusDp) {
+        GradientDrawable drawable = fill(fillColor, radiusDp);
+        drawable.setStroke(dp(1), strokeColor);
+        return drawable;
+    }
+
+    private Drawable pressable(int normal, int pressed, float radiusDp) {
+        StateListDrawable states = new StateListDrawable();
+        states.addState(new int[]{android.R.attr.state_pressed}, fill(pressed, radiusDp));
+        states.addState(new int[]{}, fill(normal, radiusDp));
+        return states;
+    }
+
+    private ColorStateList tint(int colorRes) {
+        return ColorStateList.valueOf(color(colorRes));
     }
 
     // --------------------------------------------------------------- helpers

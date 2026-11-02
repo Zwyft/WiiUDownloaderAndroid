@@ -21,7 +21,7 @@ import (
 
 const (
 	// AppVersion is shown in the Android UI.
-	AppVersion = "1.0.0-android"
+	AppVersion = "1.2.0-android"
 
 	userAgent = "WiiUDownloader-Android"
 )
